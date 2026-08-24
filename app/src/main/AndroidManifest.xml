@@ -60,6 +60,15 @@
             </intent-filter>
         </receiver>
 
+        <!-- Shizuku Provider（Sui/Shizuku v12+ 权限申请必需） -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
         <!-- FileProvider 用于分享配置和日志文件 -->
         <provider
             android:name="androidx.core.content.FileProvider"

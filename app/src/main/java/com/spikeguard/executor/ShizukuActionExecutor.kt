@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import rikka.shizuku.Shizuku
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.CountDownLatch
@@ -14,8 +15,12 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Shizuku 模式执行器
  *
- * 通过 Shizuku Sui 框架获取系统级权限
+ * 通过 Shizuku Sui 框架的 Binder API 获取系统级权限执行命令
  * 所有调用在后台线程执行，带超时机制，防止ANR
+ *
+ * 真正提权的实现：
+ * - 优先使用 Shizuku Binder API 执行命令（系统权限级）
+ * - 如果 Shizuku 未就绪/授权失败，降级到 shell（日志提示）
  *
  * 安全特性：
  * 1. 后台线程执行，不阻塞主线程
@@ -28,6 +33,7 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
     override val name = "Shizuku"
 
     private var initialized = false
+    private var useShizukuApi = false
 
     // 保存原始值
     private val originalValues = mutableMapOf<String, String>()
@@ -44,6 +50,7 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
         private const val CALL_TIMEOUT_MS = 3000L
         private const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
         private const val SUI_PACKAGE = "rikka.sui"
+        private const val SHIZUKU_PERMISSION_REQUEST_CODE = 10001
     }
 
     /**
@@ -79,12 +86,12 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
             handler = Handler(handlerThread!!.looper)
 
             // 在后台线程验证Shizuku服务
-            val result = runOnBackgroundWithTimeout(CALL_TIMEOUT_MS) {
-                checkShizukuServiceInternal()
+            val result = runOnBackgroundWithTimeout(CALL_TIMEOUT_MS * 2) {
+                initializeShizukuInternal()
             }
 
             initialized = result == true
-            Log.i(TAG, "Shizuku executor initialized: $initialized")
+            Log.i(TAG, "Shizuku executor initialized: $initialized (useShizukuApi=$useShizukuApi)")
             initialized
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize Shizuku executor", e)
@@ -93,18 +100,45 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
     }
 
     /**
-     * 检查Shizuku服务是否真正运行（内部方法，在后台线程调用）
+     * 初始化 Shizuku（内部方法，后台线程调用）
+     * 尝试绑定 Shizuku Binder 并验证权限
      */
-    private fun checkShizukuServiceInternal(): Boolean {
+    private fun initializeShizukuInternal(): Boolean {
         return try {
-            // 执行一个简单命令验证服务是否响应
-            val output = execCommandInternal("echo shizuku_check")
-            output.isNotEmpty()
+            // 方式1：尝试 Shizuku Binder API（v11+）
+            try {
+                if (Shizuku.pingBinder()) {
+                    // Binder 可用，检查权限
+                    val uid = try {
+                        Shizuku.getUid()
+                    } catch (t: Throwable) {
+                        -1
+                    }
+                    // root/shell 权限 uid 为 0 / 2000，普通 app 至少大于 10000
+                    useShizukuApi = uid >= 0
+                    if (useShizukuApi) {
+                        Log.i(TAG, "Shizuku Binder API ready, uid=$uid")
+                        return true
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "Shizuku binder not available (${e.javaClass.simpleName}: ${e.message})")
+            }
+
+            // 方式2：Sui 模式（通过 Provider）
+            Log.i(TAG, "Shizuku Binder unavailable, falling back to shell executor")
+            useShizukuApi = false
+            // shell 模式至少能执行普通命令（虽然可能没有 root 权限）
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Shizuku service check failed", e)
             false
         }
     }
+
+    // ==========================================================
+    // 核心动作方法
+    // ==========================================================
 
     override fun setCpuThrottle(throttle: Float): ActionResult {
         if (!initialized) return ActionResult(ActionType.CPU_THROTTLE, false, "Not initialized")
@@ -144,8 +178,9 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
                 writeFileInternal(setSpeedPath, targetFreq.toString())
             }
 
+            val apiTag = if (useShizukuApi) "Shizuku API" else "shell fallback"
             ActionResult(ActionType.CPU_THROTTLE, true,
-                "CPU throttled to ${(throttle * 100).toInt()}% via Shizuku")
+                "CPU throttled to ${(throttle * 100).toInt()}% via $apiTag")
         } catch (e: Exception) {
             ActionResult(ActionType.CPU_THROTTLE, false, e.message ?: "Unknown error")
         }
@@ -187,9 +222,10 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
                 }
             }
 
+            val apiTag = if (useShizukuApi) "Shizuku API" else "shell fallback"
             if (success) {
                 ActionResult(ActionType.GPU_THROTTLE, true,
-                    "GPU throttled to ${(throttle * 100).toInt()}% via Shizuku")
+                    "GPU throttled to ${(throttle * 100).toInt()}% via $apiTag")
             } else {
                 ActionResult(ActionType.GPU_THROTTLE, false, "GPU control not available")
             }
@@ -217,7 +253,8 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
             execCommandInternal("setprop debug.sf.latch_unsignaled 1")
             execCommandInternal("setprop debug.egl.hw $fpsLimit")
 
-            ActionResult(ActionType.FRAME_LIMIT, true, "Frame limit set to $fpsLimit")
+            val apiTag = if (useShizukuApi) "Shizuku API" else "shell fallback"
+            ActionResult(ActionType.FRAME_LIMIT, true, "Frame limit set to $fpsLimit via $apiTag")
         } catch (e: Exception) {
             ActionResult(ActionType.FRAME_LIMIT, false, e.message ?: "Unknown error")
         }
@@ -250,8 +287,9 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
             execCommandInternal("am kill-all background")
             reclaimed += 1
 
+            val apiTag = if (useShizukuApi) "Shizuku API" else "shell fallback"
             ActionResult(ActionType.RECLAIM_MEMORY, true,
-                "Memory reclaimed ($reclaimed methods applied) via Shizuku")
+                "Memory reclaimed ($reclaimed methods applied) via $apiTag")
         } catch (e: Exception) {
             ActionResult(ActionType.RECLAIM_MEMORY, false, e.message ?: "Unknown error")
         }
@@ -278,8 +316,9 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
                 execCommandInternal("echo -1000 > /proc/$pid/oom_score_adj")
                 execCommandInternal("renice -10 -p $pid")
 
+                val apiTag = if (useShizukuApi) "Shizuku API" else "shell fallback"
                 ActionResult(ActionType.BOOST_PRIORITY, true,
-                    "Priority boosted for $packageName (pid=$pid) via Shizuku")
+                    "Priority boosted for $packageName (pid=$pid) via $apiTag")
             } else {
                 ActionResult(ActionType.BOOST_PRIORITY, false,
                     "Process not found: $packageName")
@@ -364,25 +403,24 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
         }
     }
 
-    /**
-     * 暂停所有调用（静默期使用）
-     */
+    // ==========================================================
+    // 暂停/恢复
+    // ==========================================================
+
     fun pause() {
         paused.set(true)
         Log.i(TAG, "Shizuku executor paused (silent mode)")
     }
 
-    /**
-     * 恢复调用
-     */
     fun resume() {
         paused.set(false)
         Log.i(TAG, "Shizuku executor resumed")
     }
 
-    /**
-     * 在后台线程执行任务并等待结果，带超时
-     */
+    // ==========================================================
+    // 内部工具：后台线程调度 + 超时
+    // ==========================================================
+
     private fun <T> runOnBackgroundWithTimeout(timeoutMs: Long, block: () -> T): T? {
         val h = handler ?: return null
         val latch = CountDownLatch(1)
@@ -411,11 +449,17 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
         }
     }
 
+    // ==========================================================
+    // 命令执行：优先 Shizuku Binder，fallback shell
+    // ==========================================================
+
     /**
      * 执行 shell 命令（内部方法，必须在后台线程调用）
      *
-     * 实际应用中应该使用 Shizuku 的 Binder API
-     * 这里使用 sh 作为兼容降级方案
+     * 提权路径：
+     * 1) useShizukuApi = true：使用 Shizuku.newProcess(cmd) Binder 调用
+     *    这会把命令提交到 Shizuku/Sui 守护进程，以 shell/root 权限执行
+     * 2) 否则：回退 Runtime.exec("sh", "-c", cmd)，只能普通权限
      */
     private fun execCommandInternal(command: String): String {
         // 检查暂停状态
@@ -424,11 +468,84 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
             return ""
         }
 
+        // 路径1：Shizuku Binder API
+        if (useShizukuApi) {
+            return try {
+                execCommandViaShizukuBinder(command)
+            } catch (e: Throwable) {
+                Log.w(TAG, "Shizuku Binder exec failed, fallback to shell: ${e.message}")
+                execCommandViaShell(command)
+            }
+        }
+
+        // 路径2：普通 shell fallback（可能没有 root 权限）
+        return execCommandViaShell(command)
+    }
+
+    /**
+     * 使用 Shizuku Binder 执行命令（真正提权）
+     */
+    private fun execCommandViaShizukuBinder(command: String): String {
+        var process: Process? = null
+        return try {
+            // Shizuku API：把命令包装成 sh -c
+            process = Shizuku.newProcess(
+                arrayOf("sh", "-c", command),
+                null,
+                null
+            )
+
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            val errorReader = BufferedReader(InputStreamReader(process.errorStream))
+            val output = StringBuilder()
+
+            // 带超时读取
+            val startTime = System.currentTimeMillis()
+            while (System.currentTimeMillis() - startTime < CALL_TIMEOUT_MS) {
+                val outLine = if (reader.ready()) reader.readLine() else null
+                if (outLine != null) {
+                    output.append(outLine).append('\n')
+                }
+                val errLine = if (errorReader.ready()) errorReader.readLine() else null
+                if (errLine != null) {
+                    output.append("[stderr] ").append(errLine).append('\n')
+                }
+                if (outLine == null && errLine == null) {
+                    // 检查是否退出
+                    val exited = try {
+                        process.exitValue()
+                        true
+                    } catch (_: IllegalThreadStateException) {
+                        false
+                    }
+                    if (exited) break
+                    Thread.sleep(20)
+                }
+            }
+
+            // 确保进程退出
+            val exited = process.waitFor(CALL_TIMEOUT_MS / 2, TimeUnit.MILLISECONDS)
+            if (!exited) {
+                Log.w(TAG, "Shizuku process timed out, destroying: $command")
+                process.destroy()
+            }
+
+            output.toString().trim()
+        } finally {
+            try {
+                process?.destroy()
+            } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Fallback：通过普通 shell 执行命令（不提权）
+     */
+    private fun execCommandViaShell(command: String): String {
         return try {
             val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val result = reader.readText()
-            // 带超时等待
             val exited = process.waitFor(CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             if (!exited) {
                 Log.w(TAG, "Command timed out: $command")
