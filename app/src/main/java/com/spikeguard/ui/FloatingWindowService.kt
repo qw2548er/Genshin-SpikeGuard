@@ -275,7 +275,12 @@ class FloatingWindowService : Service() {
             addAction(UiStateBridge.ACTION_MODE_CHANGED)
             addAction(UiStateBridge.ACTION_SILENT_MODE_CHANGED)
         }
-        registerReceiver(uiStateReceiver, filter)
+        // Android 13+ 必须指定 exported 标志
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(uiStateReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(uiStateReceiver, filter)
+        }
     }
 
     /**
