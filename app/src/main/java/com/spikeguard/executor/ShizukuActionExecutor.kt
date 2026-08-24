@@ -3,9 +3,15 @@ package com.spikeguard.executor
 import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.IBinder
+import android.os.Parcel
+import android.os.ParcelFileDescriptor
+import android.os.RemoteException
 import android.util.Log
 import rikka.shizuku.Shizuku
+import moe.shizuku.server.IRemoteProcess
 import java.io.BufferedReader
+import java.io.FileInputStream
 import java.io.InputStreamReader
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -484,57 +490,102 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
 
     /**
      * 使用 Shizuku Binder 执行命令（真正提权）
+     *
+     * Shizuku v13 没有暴露公开的 newProcess()，需要：
+     * 1) 用 Shizuku.transactRemote(code=TRANSACTION_newProcess=8) 自己打 Parcel
+     * 2) reply 里 readStrongBinder 得到 IRemoteProcess.Stub.asInterface(...)
+     * 3) 通过 IRemoteProcess.getInputStream/getErrorStream/waitFor 读取输出
      */
     private fun execCommandViaShizukuBinder(command: String): String {
-        var process: Process? = null
+        var data: Parcel? = null
+        var reply: Parcel? = null
+        var remoteProcess: IRemoteProcess? = null
+        var stdoutFd: ParcelFileDescriptor? = null
+        var stderrFd: ParcelFileDescriptor? = null
+
         return try {
-            // Shizuku API：把命令包装成 sh -c
-            process = Shizuku.newProcess(
-                arrayOf("sh", "-c", command),
-                null,
-                null
-            )
+            val cmd = arrayOf("sh", "-c", command)
+            data = Parcel.obtain()
+            reply = Parcel.obtain()
+            data.writeInterfaceToken("moe.shizuku.server.IShizukuService")
+            data.writeStringArray(cmd)
+            data.writeStringArray(null as Array<String?>?)  // env
+            data.writeString(null as String?)                // cwd
 
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val errorReader = BufferedReader(InputStreamReader(process.errorStream))
-            val output = StringBuilder()
+            // Shizuku.transactRemote(code, data, reply): code=8 -> newProcess
+            Shizuku.transactRemote(data, reply, 8)
 
-            // 带超时读取
+            reply.readException()
+            val binder: IBinder? = reply.readStrongBinder()
+            remoteProcess = if (binder != null) {
+                IRemoteProcess.Stub.asInterface(binder)
+            } else {
+                Log.w(TAG, "newProcess returned null binder")
+                return ""
+            }
+
+            // 拿 stdout / stderr 的文件描述符
+            stdoutFd = remoteProcess.inputStream
+            stderrFd = remoteProcess.errorStream
+
+            val outBuilder = StringBuilder()
+            val stdoutReader = BufferedReader(InputStreamReader(FileInputStream(stdoutFd.fileDescriptor)))
+            val stderrReader = BufferedReader(InputStreamReader(FileInputStream(stderrFd.fileDescriptor)))
+
             val startTime = System.currentTimeMillis()
             while (System.currentTimeMillis() - startTime < CALL_TIMEOUT_MS) {
-                val outLine = if (reader.ready()) reader.readLine() else null
-                if (outLine != null) {
-                    output.append(outLine).append('\n')
+                if (stdoutReader.ready()) {
+                    val line = stdoutReader.readLine()
+                    if (line != null) outBuilder.append(line).append('\n')
+                } else {
+                    val buf = CharArray(4096)
+                    val n = stdoutReader.read(buf)
+                    if (n > 0) outBuilder.appendRange(buf, 0, n)
                 }
-                val errLine = if (errorReader.ready()) errorReader.readLine() else null
-                if (errLine != null) {
-                    output.append("[stderr] ").append(errLine).append('\n')
+                if (stderrReader.ready()) {
+                    val line = stderrReader.readLine()
+                    if (line != null) outBuilder.append("[stderr] ").append(line).append('\n')
                 }
-                if (outLine == null && errLine == null) {
-                    // 检查是否退出
+                // 看进程是否退出
+                val exited = try {
+                    remoteProcess.exitValue()
+                    true
+                } catch (_: IllegalThreadStateException) {
+                    false
+                } catch (_: RemoteException) {
+                    false
+                }
+                if (exited) break
+                Thread.sleep(20)
+            }
+
+            // 等待进程退出（最长 CALL_TIMEOUT_MS/2）
+            run waitForBlock@ {
+                val t0 = System.currentTimeMillis()
+                while (System.currentTimeMillis() - t0 < CALL_TIMEOUT_MS / 2) {
                     val exited = try {
-                        process.exitValue()
+                        remoteProcess.exitValue()
                         true
-                    } catch (_: IllegalThreadStateException) {
+                    } catch (_: Throwable) {
                         false
                     }
-                    if (exited) break
+                    if (exited) return@waitForBlock
                     Thread.sleep(20)
                 }
+                Log.w(TAG, "Shizuku process timed out, destroy: $command")
+                try { remoteProcess.destroy() } catch (_: Throwable) {}
             }
 
-            // 确保进程退出
-            val exited = process.waitFor(CALL_TIMEOUT_MS / 2, TimeUnit.MILLISECONDS)
-            if (!exited) {
-                Log.w(TAG, "Shizuku process timed out, destroying: $command")
-                process.destroy()
-            }
-
-            output.toString().trim()
+            outBuilder.toString().trim()
+        } catch (t: Throwable) {
+            Log.w(TAG, "Shizuku binder newProcess failed: ${t.javaClass.simpleName} ${t.message}")
+            throw t
         } finally {
-            try {
-                process?.destroy()
-            } catch (_: Exception) {}
+            try { remoteProcess?.destroy() } catch (_: Throwable) {}
+            try { stdoutFd?.close() } catch (_: Throwable) {}
+            try { stderrFd?.close() } catch (_: Throwable) {}
+            data?.recycle()
+            reply?.recycle()
         }
     }
 
