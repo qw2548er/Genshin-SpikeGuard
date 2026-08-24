@@ -1,0 +1,101 @@
+{
+  "version": "1.0.0",
+  "general": {
+    "run_mode": "log_only",
+    "permission_mode": "none",
+    "sample_interval_ms": 500,
+    "heartbeat_interval_ms": 3000,
+    "protection_cooldown_ms": 5000
+  },
+  "scenes": {
+    "gun_limit_challenge": {
+      "name": "枪限挑战",
+      "description": "大量敌人同时生成与销毁的高压力场景",
+      "enabled": true,
+      "detection": {
+        "entity_rate_threshold": 20,
+        "spike_window_ms": 3000,
+        "consecutive_spikes": 3
+      },
+      "protection": {
+        "cpu_throttle": 0.7,
+        "gpu_throttle": 0.6,
+        "frame_limit": 30,
+        "duration_ms": 8000,
+        "fade_out_ms": 3000
+      },
+      "risk_mitigation": {
+        "max_daily_triggers": 50,
+        "cooldown_after_max": 3600000,
+        "gradual_escalation": true
+      }
+    },
+    "thousand_star_domain": {
+      "name": "千星奇域",
+      "description": "大量特效和实体的高渲染压力场景",
+      "enabled": true,
+      "detection": {
+        "entity_rate_threshold": 15,
+        "spike_window_ms": 2000,
+        "consecutive_spikes": 2
+      },
+      "protection": {
+        "cpu_throttle": 0.75,
+        "gpu_throttle": 0.65,
+        "frame_limit": 45,
+        "duration_ms": 6000,
+        "fade_out_ms": 2000
+      },
+      "risk_mitigation": {
+        "max_daily_triggers": 80,
+        "cooldown_after_max": 1800000,
+        "gradual_escalation": true
+      }
+    },
+    "new_nation_dungeon": {
+      "name": "新国家副本",
+      "description": "新区域副本中大规模战斗场景",
+      "enabled": true,
+      "detection": {
+        "entity_rate_threshold": 25,
+        "spike_window_ms": 4000,
+        "consecutive_spikes": 4
+      },
+      "protection": {
+        "cpu_throttle": 0.65,
+        "gpu_throttle": 0.55,
+        "frame_limit": 30,
+        "duration_ms": 10000,
+        "fade_out_ms": 4000
+      },
+      "risk_mitigation": {
+        "max_daily_triggers": 30,
+        "cooldown_after_max": 7200000,
+        "gradual_escalation": true
+      }
+    }
+  },
+  "gpu_monitor": {
+    "spike_threshold_percent": 85,
+    "baseline_window_ms": 10000,
+    "spike_cooldown_ms": 2000
+  },
+  "frame_monitor": {
+    "drop_threshold_percent": 40,
+    "min_fps": 15,
+    "drop_window_ms": 1000
+  },
+  "risk_mitigation": {
+    "account_safety_level": "normal",
+    "max_protections_per_hour": 20,
+    "min_interval_between_protections_ms": 2000,
+    "warning_threshold_count": 10,
+    "auto_slow_down_after_warnings": true
+  },
+  "logging": {
+    "level": "INFO",
+    "max_log_size_mb": 50,
+    "log_to_file": true,
+    "include_metrics": true
+  }
+}
