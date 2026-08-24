@@ -1,8 +1,8 @@
 package com.spikeguard.collector
 
 import android.content.Context
+import com.spikeguard.core.EventType
 import kotlinx.coroutines.*
-import kotlinx.coroutines.android.awaitFrame
 import kotlin.math.max
 import kotlin.math.min
 

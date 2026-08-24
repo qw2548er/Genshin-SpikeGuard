@@ -272,7 +272,7 @@ class DecisionEngine(
         // 渐进式升级
         val sceneState = sceneStates[sceneId]
         val escalationFactor = if (gradual && sceneState != null) {
-            min(1f, 0.5f + sceneState.protectionCount * 0.1f)
+            (0.5f + sceneState.protectionCount * 0.1f).coerceAtMost(1f)
         } else {
             1f
         }
@@ -380,7 +380,10 @@ class DecisionEngine(
         android.util.Log.i(TAG, "Releasing protection for scene=$sceneId")
 
         // 更新场景状态
-        sceneStates[sceneId] = sceneStates[sceneId]?.copy(active = false)
+        val currentState = sceneStates[sceneId]
+        if (currentState != null) {
+            sceneStates[sceneId] = currentState.copy(active = false)
+        }
 
         updateRiskLevel(RiskLevel.LOW)
 
