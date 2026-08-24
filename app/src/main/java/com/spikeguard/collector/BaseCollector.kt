@@ -10,10 +10,12 @@ import com.spikeguard.core.MessageBus
 data class MetricsSample(
     val timestamp: Long,
     val gpuLoad: Float,        // GPU 负载 0-100%
+    val gpuFreqMhz: Int,       // GPU频率 MHz
     val cpuLoad: Float,        // CPU 负载 0-100%
     val fps: Int,              // 当前帧率
     val frameTimeMs: Float,    // 帧时间
     val memoryUsedMb: Int,     // 内存使用
+    val memoryTotalMb: Int,    // 总内存
     val temperature: Float,    // 温度
     val entityEstimate: Int    // 估算实体数量（通过帧率/GPU反推）
 )
@@ -68,10 +70,12 @@ abstract class BaseCollector {
         bus.publish(
             EventType.METRICS_SAMPLE,
             "gpu_load" to sample.gpuLoad,
+            "gpu_freq_mhz" to sample.gpuFreqMhz,
             "cpu_load" to sample.cpuLoad,
             "fps" to sample.fps,
             "frame_time_ms" to sample.frameTimeMs,
-            "memory_mb" to sample.memoryUsedMb,
+            "memory_used_mb" to sample.memoryUsedMb,
+            "memory_total_mb" to sample.memoryTotalMb,
             "temperature" to sample.temperature,
             "entity_estimate" to sample.entityEstimate,
             "timestamp" to sample.timestamp

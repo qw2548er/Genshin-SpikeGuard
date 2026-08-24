@@ -494,41 +494,7 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
         return max(0, estimate + jitter)
     }
 
-    // ========== 数据发布 ==========
-
-    private fun publishMetrics(sample: MetricsSample) {
-        bus.publish(
-            EventType.METRICS_SAMPLE,
-            "timestamp" to sample.timestamp,
-            "gpu_load" to sample.gpuLoad,
-            "gpu_freq_mhz" to sample.gpuFreqMhz,
-            "cpu_load" to sample.cpuLoad,
-            "fps" to sample.fps,
-            "frame_time_ms" to sample.frameTimeMs,
-            "memory_used_mb" to sample.memoryUsedMb,
-            "memory_total_mb" to sample.memoryTotalMb,
-            "temperature" to sample.temperature,
-            "entity_estimate" to sample.entityEstimate
-        )
-    }
-
     companion object {
         private const val TAG = "GpuFrameCollector"
     }
 }
-
-/**
- * 性能采样数据
- */
-data class MetricsSample(
-    val timestamp: Long,
-    val gpuLoad: Float,
-    val gpuFreqMhz: Int,
-    val cpuLoad: Float,
-    val fps: Int,
-    val frameTimeMs: Float,
-    val memoryUsedMb: Int,
-    val memoryTotalMb: Int,
-    val temperature: Float,
-    val entityEstimate: Int
-)
