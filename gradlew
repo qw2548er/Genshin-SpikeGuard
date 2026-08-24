@@ -44,16 +44,26 @@
 #
 #       The "traditional" practice of packing multiple parameters into a
 #       space-separated string is a well documented source of bugs and security
-#       problems, so this is (to the extent possible) avoided, by
-#       accumulating options in "$@", and eventually passing that to Java.
+#       problems, so this is (mostly) avoided, by progressively accumulating
+#       options in "$@", and eventually passing that to Java.
 #
-#       Where the accumulated options for the JVM and the classpath etc need
-#       to be split between "default JVM opts" and "extra JVM opts", we
-#       use two separate invocations of the "collect" function, and
-#       combine them later.
+#       Where the inherited environment variables (DEFAULT_JVM_OPTS, JAVA_OPTS,
+#       and GRADLE_OPTS) rely on word-splitting, this is performed explicitly;
+#       see the in-line comments for details.
+#
+#       There are tweaks for specific operating systems such as AIX, CygWin,
+#       Darwin, MinGW, and NonStop.
+#
+#   (3) This script is generated from the Groovy template
+#       https://github.com/gradle/gradle/blob/HEAD/subprojects/plugins/src/main/resources/org/gradle/api/internal/plugins/unixStartScript.txt
+#       within the Gradle project.
+#
+#       You can find Gradle at https://github.com/gradle/gradle/.
+#
 ##############################################################################
 
 # Attempt to set APP_HOME
+
 # Resolve links: $0 may be a link
 app_path=$0
 
@@ -62,7 +72,7 @@ while
     APP_HOME=${app_path%"${app_path##*/}"}  # leaves a trailing /; empty if no leading path
     [ -h "$app_path" ]
 do
-    ls=$( ls -ld -- "$app_path" )
+    ls=$( ls -ld "$app_path" )
     link=${ls#*' -> '}
     case $link in             #(
       /*)   app_path=$link ;; #(
@@ -73,7 +83,8 @@ done
 # This is normally unused
 # shellcheck disable=SC2034
 APP_BASE_NAME=${0##*/}
-APP_HOME=$( cd "${APP_HOME:-./}" && pwd -P ) || exit
+# Discard cd standard output in case $CDPATH is set (https://github.com/gradle/gradle/issues/25036)
+APP_HOME=$( cd "${APP_HOME:-./}" > /dev/null && pwd -P ) || exit
 
 # Use the maximum available, or set MAX_FD != -1 to use that value.
 MAX_FD=maximum
@@ -107,6 +118,7 @@ CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
 # Determine the Java command to use to start the JVM.
 if [ -n "$JAVA_HOME" ] ; then
     if [ -x "$JAVA_HOME/jre/sh/java" ] ; then
+        # IBM's JDK on AIX uses strange locations for the executables
         JAVACMD=$JAVA_HOME/jre/sh/java
     else
         JAVACMD=$JAVA_HOME/bin/java
@@ -133,7 +145,7 @@ if ! "$cygwin" && ! "$darwin" && ! "$nonstop" ; then
     case $MAX_FD in #(
       max*)
         # In POSIX sh, ulimit -H is undefined. That's why the result is checked to see if it worked.
-        # shellcheck disable=SC3045
+        # shellcheck disable=SC2039,SC3045
         MAX_FD=$( ulimit -H -n ) ||
             warn "Could not query maximum file descriptor limit"
     esac
@@ -141,7 +153,7 @@ if ! "$cygwin" && ! "$darwin" && ! "$nonstop" ; then
       '' | soft) :;; #(
       *)
         # In POSIX sh, ulimit -n is undefined. That's why the result is checked to see if it worked.
-        # shellcheck disable=SC3045
+        # shellcheck disable=SC2039,SC3045
         ulimit -n "$MAX_FD" ||
             warn "Could not set maximum file descriptor limit to $MAX_FD"
     esac
@@ -153,9 +165,7 @@ fi
 #   * -classpath
 #   * -D...appname settings
 #   * --module-path (only if needed)
-#   * default JVM options
-#   * default JVM options from JAVA_OPTS
-#   * default JVM options from GRADLE_OPTS
+#   * DEFAULT_JVM_OPTS, JAVA_OPTS, and GRADLE_OPTS environment variables.
 
 # For Cygwin or MSYS, switch paths to Windows format before running java
 if "$cygwin" || "$msys" ; then
@@ -168,11 +178,11 @@ if "$cygwin" || "$msys" ; then
     for arg do
         if
             case $arg in                                #(
-              -*)   t=1 ;;                            # don't mess with options #(
-              /?*)  t=${#arg} ; t=2 ;;     # don't mess with /? style options
-              *)    t= ;;
+              -*)   false ;;                            # don't mess with options #(
+              /?*)  t=${arg#/} t=/${t%%/*}              # looks like a POSIX filepath
+                    [ -e "$t" ] ;;                      #(
+              *)    false ;;
             esac
-            [ -z "$t" ]
         then
             arg=$( cygpath --path --ignore --mixed "$arg" )
         fi
@@ -188,79 +198,52 @@ if "$cygwin" || "$msys" ; then
     done
 fi
 
-# Collect all arguments for the java command;
-#   * $DEFAULT_JVM_OPTS, $JAVA_OPTS, and $GRADLE_OPTS can contain fragments of
-#     shell script including quotes and backslash escapes, so we pass them
-#     through `eval set --` to expand them into positional parameters.
-#   * To avoid expansion of shell metacharacters within the argument list,
-#     we use `eval` with single quotes around each argument.
-#   * We use the following convention:
-#       args = collect "$DEFAULT_JVM_OPTS" $JAVA_OPTS $GRADLE_OPTS
-#     where collect is a function that accumulates arguments in the
-#     "collected" variable.
 
 # Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
-DEFAULT_JVM_OPTS='"-Xmx64m" "-Xms64m"'
+DEFAULT_JVM_OPTS='-Dfile.encoding=UTF-8 "-Xmx64m" "-Xms64m"'
 
 # Collect all arguments for the java command:
-#   * DEFAULT_JVM_OPTS, JAVA_OPTS, JAVA_OPTS, and opts_variable get expanded
-#     using eval set -- so that embedded quotes and backslash escapes are
-#     processed correctly.
-#   * Other arguments are passed through as-is.
+#   * DEFAULT_JVM_OPTS, JAVA_OPTS, JAVA_OPTS, and optsEnvironmentVar are not allowed to contain shell fragments,
+#     and any embedded shellness will be escaped.
+#   * For example: A user cannot expect ${Hostname} to be expanded, as it is an environment variable and will be
+#     treated as '${Hostname}' itself on the command line.
 
-collect () {
-    set -- \
+set -- \
         "-Dorg.gradle.appname=$APP_BASE_NAME" \
         -classpath "$CLASSPATH" \
         org.gradle.wrapper.GradleWrapperMain \
         "$@"
 
-    # Stop when "xgradle" command is found in PATH.
-    # This is only used for integration tests of the Gradle wrapper.
-    if [ -n "$GRADLE_COMMANDS_PATH" ] ; then
-        PATH="$GRADLE_COMMANDS_PATH:$PATH"
-    fi
+# Stop when "xargs" is not available.
+if ! command -v xargs >/dev/null 2>&1
+then
+    die "xargs is not available"
+fi
 
-    # Use the maximum available, or set MAX_FD != -1 to use that value.
-    if [ "$cygwin" = false -a "$darwin" = false -a "$nonstop" = false ] ; then
-        case $MAX_FD in #(
-          max*)
-            MAX_FD=$( ulimit -H -n ) ||
-                warn "Could not query maximum file descriptor limit"
-        esac
-        case $MAX_FD in  #(
-          '' | soft) :;; #(
-          *)
-            ulimit -n "$MAX_FD" ||
-                warn "Could not set maximum file descriptor limit to $MAX_FD"
-        esac
-    fi
-
-    exec "$JAVACMD" "$@"
-}
-
-# Parse the command line. We need to know the options before we can properly
-# quote the classpath.
+# Use "xargs" to parse quoted args.
 #
-# For each argument, we look for known options and handle them accordingly.
-# The rest of the arguments are passed through to the Java command.
-
-# Collect default JVM options from environment variables.
-# shellcheck disable=SC2086
-eval set -- $DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS
-
-# Add the main class and the rest of the arguments.
-set -- "$@" -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
-
-# Now shift off the JVM options and classpath, leaving the original arguments
-# plus the main class name and the Gradle wrapper main class.
+# With -n1 it outputs one arg per line, with the quotes and backslashes removed.
 #
-# We need to do this so that we can put the appname property and the
-# classpath first, then the JVM options from the environment, then the
-# original arguments.
+# In Bash we could simply go:
 #
-# Actually we don't need to do this, but the original script did it and it
-# doesn't hurt anything.
+#   readarray ARGS < <( xargs -n1 <<<"$var" ) &&
+#   set -- "${ARGS[@]}" "$@"
+#
+# but POSIX shell has neither arrays nor command substitution, so instead we
+# post-process each arg (as a line of input to sed) to backslash-escape any
+# character that might be a shell metacharacter, then use eval to reverse
+# that process (while maintaining the separation between arguments), and wrap
+# the whole thing up as a single "set" statement.
+#
+# This will of course break if any of these variables contains a newline or
+# an unmatched quote.
+#
 
-# Actually, just run the Java command with all the arguments.
+eval "set -- $(
+        printf '%s\n' "$DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS" |
+        xargs -n1 |
+        sed ' s~[^-[:alnum:]+,./:=@_]~\\&~g; ' |
+        tr '\n' ' '
+    )" '"$@"'
+
 exec "$JAVACMD" "$@"
