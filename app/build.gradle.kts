@@ -17,9 +17,25 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("release") {
+            // 使用 debug keystore 进行 CI 构建
+            // 正式发布请替换为正式签名
+            val debugStoreFile = file("${System.getenv("ANDROID_SDK_ROOT") ?: ""}/.android/debug.keystore")
+            if (debugStoreFile.exists()) {
+                storeFile = debugStoreFile
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
