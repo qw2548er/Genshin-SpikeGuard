@@ -1,6 +1,9 @@
 package com.spikeguard.ui
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -10,13 +13,11 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.spikeguard.R
 import com.spikeguard.core.ConfigManager
-import com.spikeguard.core.EventType
-import com.spikeguard.core.MessageBus
 import com.spikeguard.core.PermissionMode
 import com.spikeguard.core.RunMode
+import com.spikeguard.core.UiStateBridge
 import com.spikeguard.service.GuardService
 import com.spikeguard.util.LogManager
 import com.spikeguard.util.PermissionStatusChecker
@@ -35,7 +36,6 @@ import com.spikeguard.util.PermissionStatusChecker
 class MainActivity : AppCompatActivity() {
 
     private lateinit var configManager: ConfigManager
-    private val bus = MessageBus.getInstance()
 
     // UI 组件
     private lateinit var tvStatus: TextView
@@ -63,6 +63,9 @@ class MainActivity : AppCompatActivity() {
     private var serviceRunning = false
     private lateinit var permissionChecker: PermissionStatusChecker
 
+    // 跨进程广播接收器
+    private lateinit var uiStateReceiver: BroadcastReceiver
+
     companion object {
         private const val REQUEST_CODE_IMPORT_CONFIG = 1001
         private const val REQUEST_CODE_OVERLAY = 1002
@@ -88,34 +91,8 @@ class MainActivity : AppCompatActivity() {
         // 检测权限状态（异步，不阻塞主线程）
         checkPermissionStatus()
 
-        // 订阅 UI 更新事件
-        bus.subscribe(EventType.UI_STATE_UPDATE) { event ->
-            runOnUiThread {
-                updateUiState(event.data)
-            }
-        }
-
-        bus.subscribe(EventType.RISK_LEVEL_CHANGED) { event ->
-            runOnUiThread {
-                val level = event.data["risk_level"] as? String ?: "LOW"
-                tvRiskLevel.text = "风险等级: $level"
-            }
-        }
-
-        bus.subscribe(EventType.PROTECTION_TRIGGERED) { event ->
-            runOnUiThread {
-                val sceneName = event.data["scene_name"] as? String ?: "未知"
-                tvStatus.text = "保护中 - $sceneName"
-                tvStatus.setTextColor(getColor(R.color.protecting))
-            }
-        }
-
-        bus.subscribe(EventType.PROTECTION_RELEASED) { _ ->
-            runOnUiThread {
-                tvStatus.text = "监控中"
-                tvStatus.setTextColor(getColor(R.color.monitoring))
-            }
-        }
+        // 注册跨进程广播接收器（接收来自:guard服务进程的UI状态更新）
+        registerUiStateReceiver()
     }
 
     private fun initViews() {
@@ -204,6 +181,149 @@ class MainActivity : AppCompatActivity() {
 
         btnClearLog.setOnClickListener {
             clearLogs()
+        }
+    }
+
+    /**
+     * 注册跨进程UI状态广播接收器
+     * 接收来自:guard服务进程的实时数据更新
+     */
+    private fun registerUiStateReceiver() {
+        uiStateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                intent ?: return
+                when (intent.action) {
+                    UiStateBridge.ACTION_UI_STATE_UPDATE -> {
+                        val extras = intent.extras ?: return
+                        updateUiStateFromBundle(extras)
+                    }
+                    UiStateBridge.ACTION_PROTECTION_EVENT -> {
+                        val eventType = intent.getStringExtra("event_type")
+                        val sceneName = intent.getStringExtra("scene_name") ?: "未知"
+                        when (eventType) {
+                            "triggered" -> {
+                                tvStatus.text = "保护中 - $sceneName"
+                                tvStatus.setTextColor(getColor(R.color.protecting))
+                            }
+                            "released" -> {
+                                tvStatus.text = "监控中"
+                                tvStatus.setTextColor(getColor(R.color.monitoring))
+                            }
+                        }
+                    }
+                    UiStateBridge.ACTION_SERVICE_EVENT -> {
+                        val eventType = intent.getStringExtra("event_type")
+                        when (eventType) {
+                            "started" -> {
+                                serviceRunning = true
+                                tvStatus.text = "监控中"
+                                tvStatus.setTextColor(getColor(R.color.monitoring))
+                                btnStart.isEnabled = false
+                                btnStop.isEnabled = true
+                            }
+                            "stopped" -> {
+                                serviceRunning = false
+                                tvStatus.text = "已停止"
+                                tvStatus.setTextColor(getColor(R.color.stopped))
+                                btnStart.isEnabled = true
+                                btnStop.isEnabled = false
+                            }
+                        }
+                    }
+                    UiStateBridge.ACTION_SILENT_MODE_CHANGED -> {
+                        val active = intent.getBooleanExtra("active", false)
+                        if (active) {
+                            tvStatus.text = "静默中 - 原神启动保护"
+                            tvStatus.setTextColor(getColor(R.color.warning))
+                        }
+                    }
+                }
+            }
+        }
+
+        val filter = IntentFilter().apply {
+            addAction(UiStateBridge.ACTION_UI_STATE_UPDATE)
+            addAction(UiStateBridge.ACTION_PROTECTION_EVENT)
+            addAction(UiStateBridge.ACTION_SERVICE_EVENT)
+            addAction(UiStateBridge.ACTION_SILENT_MODE_CHANGED)
+            addAction(UiStateBridge.ACTION_MODE_CHANGED)
+        }
+        registerReceiver(uiStateReceiver, filter)
+    }
+
+    /**
+     * 从Bundle更新UI状态
+     */
+    private fun updateUiStateFromBundle(extras: Bundle) {
+        val fps = extras.getInt("fps", 0)
+        val gpuLoad = extras.getFloat("gpu_load", 0f)
+        val cpuLoad = extras.getFloat("cpu_load", 0f)
+        val temperature = extras.getFloat("temperature", 0f)
+        val entityEstimate = extras.getInt("entity_estimate", 0)
+        val protectionsToday = extras.getInt("protections_today", 0)
+        val riskLevel = extras.getString("risk_level", "LOW")
+        val silentMode = extras.getBoolean("silent_mode", false)
+
+        tvFps.text = "$fps FPS"
+        tvGpuLoad.text = "GPU: ${"%.1f".format(gpuLoad)}%"
+        tvCpuLoad.text = "CPU: ${"%.1f".format(cpuLoad)}%"
+        tvTemperature.text = "温度: ${"%.1f".format(temperature)}°C"
+        tvEntityEstimate.text = "估算实体: ~$entityEstimate"
+        tvProtections.text = "今日保护: $protectionsToday 次"
+        tvRiskLevel.text = "风险等级: $riskLevel"
+
+        // 帧率颜色
+        tvFps.setTextColor(
+            when {
+                fps >= 50 -> getColor(R.color.good)
+                fps >= 30 -> getColor(R.color.warning)
+                else -> getColor(R.color.danger)
+            }
+        )
+
+        // GPU 负载颜色
+        tvGpuLoad.setTextColor(
+            when {
+                gpuLoad < 60 -> getColor(R.color.good)
+                gpuLoad < 85 -> getColor(R.color.warning)
+                else -> getColor(R.color.danger)
+            }
+        )
+
+        // CPU 负载颜色
+        tvCpuLoad.setTextColor(
+            when {
+                cpuLoad < 60 -> getColor(R.color.good)
+                cpuLoad < 85 -> getColor(R.color.warning)
+                else -> getColor(R.color.danger)
+            }
+        )
+
+        // 静默模式状态
+        if (silentMode) {
+            tvStatus.text = "静默中 - 原神启动保护"
+            tvStatus.setTextColor(getColor(R.color.warning))
+        }
+    }
+
+    /**
+     * 检查服务是否在运行
+     */
+    private fun checkServiceStatus() {
+        val am = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
+        var running = false
+        for (service in am.getRunningServices(100)) {
+            if (service.service.className == GuardService::class.java.name) {
+                running = true
+                break
+            }
+        }
+        serviceRunning = running
+        if (running) {
+            tvStatus.text = "监控中"
+            tvStatus.setTextColor(getColor(R.color.monitoring))
+            btnStart.isEnabled = false
+            btnStop.isEnabled = true
         }
     }
 
@@ -530,18 +650,23 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 启动消息总线（如果未启动）
-        bus.start()
+        // 检查服务是否在运行并更新UI状态
+        checkServiceStatus()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        // 注销广播接收器
+        try {
+            unregisterReceiver(uiStateReceiver)
+        } catch (e: Exception) {
+            // 忽略
+        }
         // 释放权限检测器资源
         try {
             permissionChecker.release()
         } catch (e: Exception) {
             // 忽略
         }
-        // 注意：不停止总线，因为服务可能还在运行
     }
 }

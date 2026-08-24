@@ -1,9 +1,13 @@
 package com.spikeguard.ui
 
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.util.TypedValue
 import android.view.Gravity
@@ -13,8 +17,7 @@ import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.spikeguard.R
-import com.spikeguard.core.EventType
-import com.spikeguard.core.MessageBus
+import com.spikeguard.core.UiStateBridge
 import kotlin.math.abs
 
 /**
@@ -33,7 +36,7 @@ class FloatingWindowService : Service() {
     private var minimized = false
     private var alpha = 0.9f
 
-    private val bus = MessageBus.getInstance()
+    private lateinit var uiStateReceiver: BroadcastReceiver
 
     // 拖拽相关
     private var initialX = 0
@@ -51,7 +54,7 @@ class FloatingWindowService : Service() {
         super.onCreate()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         createFloatingBall()
-        subscribeToEvents()
+        registerUiStateReceiver()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -62,6 +65,11 @@ class FloatingWindowService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        try {
+            unregisterReceiver(uiStateReceiver)
+        } catch (e: Exception) {
+            // 忽略
+        }
         removeFloatingBall()
     }
 
@@ -221,39 +229,53 @@ class FloatingWindowService : Service() {
     }
 
     /**
-     * 订阅事件更新UI
+     * 注册跨进程UI状态广播接收器
      */
-    private fun subscribeToEvents() {
-        bus.subscribe(EventType.UI_STATE_UPDATE) { event ->
-            val gpuSpikes = event.data["gpu_spikes"] as? Int ?: 0
-            val totalProtections = event.data["total_protections"] as? Int ?: 0
-            val silentMode = event.data["silent_mode"] as? Boolean ?: false
+    private fun registerUiStateReceiver() {
+        uiStateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                intent ?: return
+                when (intent.action) {
+                    UiStateBridge.ACTION_UI_STATE_UPDATE -> {
+                        val extras = intent.extras ?: return
+                        val gpuSpikes = extras.getInt("gpu_spikes", 0)
+                        val totalProtections = extras.getInt("total_protections", 0)
+                        val silentMode = extras.getBoolean("silent_mode", false)
 
-            tvSpikes?.text = "尖峰: $gpuSpikes"
-            tvProtections?.text = "防护: $totalProtections"
+                        tvSpikes?.text = "尖峰: $gpuSpikes"
+                        tvProtections?.text = "防护: $totalProtections"
 
-            if (silentMode) {
-                tvMode?.text = "静默中"
+                        if (silentMode) {
+                            tvMode?.text = "静默中"
+                        }
+                    }
+                    UiStateBridge.ACTION_PROTECTION_EVENT -> {
+                        val eventType = intent.getStringExtra("event_type")
+                        val logOnly = intent.getBooleanExtra("log_only", false)
+                        when (eventType) {
+                            "triggered" -> {
+                                tvMode?.text = if (logOnly) "日志模式" else "保护中"
+                            }
+                            "released" -> {
+                                tvMode?.text = "监控中"
+                            }
+                        }
+                    }
+                    UiStateBridge.ACTION_MODE_CHANGED -> {
+                        val runMode = intent.getStringExtra("run_mode") ?: "LOG_ONLY"
+                        tvMode?.text = if (runMode == "FULL_PROTECT") "完整防护" else "日志模式"
+                    }
+                }
             }
         }
 
-        bus.subscribe(EventType.PROTECTION_TRIGGERED) { event ->
-            val logOnly = event.data["log_only"] as? Boolean ?: false
-            if (logOnly) {
-                tvMode?.text = "日志模式"
-            } else {
-                tvMode?.text = "保护中"
-            }
+        val filter = IntentFilter().apply {
+            addAction(UiStateBridge.ACTION_UI_STATE_UPDATE)
+            addAction(UiStateBridge.ACTION_PROTECTION_EVENT)
+            addAction(UiStateBridge.ACTION_MODE_CHANGED)
+            addAction(UiStateBridge.ACTION_SILENT_MODE_CHANGED)
         }
-
-        bus.subscribe(EventType.PROTECTION_RELEASED) { _ ->
-            tvMode?.text = "监控中"
-        }
-
-        bus.subscribe(EventType.MODE_CHANGED) { event ->
-            val runMode = event.data["run_mode"] as? String ?: "LOG_ONLY"
-            tvMode?.text = if (runMode == "FULL_PROTECT") "完整防护" else "日志模式"
-        }
+        registerReceiver(uiStateReceiver, filter)
     }
 
     /**

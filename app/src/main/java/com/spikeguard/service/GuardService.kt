@@ -17,8 +17,10 @@ import com.spikeguard.collector.GpuFrameCollector
 import com.spikeguard.core.ConfigManager
 import com.spikeguard.core.EventType
 import com.spikeguard.core.MessageBus
+import com.spikeguard.core.UiStateBridge
 import com.spikeguard.decision.DecisionEngine
 import com.spikeguard.executor.ExecutionManager
+import com.spikeguard.util.LogManager
 
 /**
  * 守护前台服务
@@ -38,6 +40,7 @@ class GuardService : Service() {
     private lateinit var collector: GpuFrameCollector
     private lateinit var decisionEngine: DecisionEngine
     private lateinit var executionManager: ExecutionManager
+    private lateinit var uiStateBridge: UiStateBridge
 
     // 心跳使用主线程（轻量操作）
     private var heartbeatHandler = Handler(android.os.Looper.getMainLooper())
@@ -169,6 +172,13 @@ class GuardService : Service() {
 
         startTime = System.currentTimeMillis()
 
+        // 初始化日志系统（必须最先初始化）
+        val logManager = LogManager.getInstance(this)
+        logManager.initialize()
+        logManager.setLogLevel(LogManager.LogLevel.DEBUG)
+        logManager.i(TAG, "=== SpikeGuard Service starting ===")
+        logManager.i(TAG, "Process PID: ${android.os.Process.myPid()}")
+
         // 创建通知渠道
         createNotificationChannel()
 
@@ -268,6 +278,10 @@ class GuardService : Service() {
 
         // 启动采集器
         collector.start(sampleInterval)
+
+        // 启动跨进程UI状态桥接
+        uiStateBridge = UiStateBridge(this)
+        uiStateBridge.start()
 
         updateNotification("运行中 - 保护已启用")
     }
