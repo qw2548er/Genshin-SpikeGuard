@@ -1,9 +1,13 @@
 package com.spikeguard.executor
 
 import android.content.Context
+import android.os.Handler
+import android.os.HandlerThread
 import com.spikeguard.core.ConfigManager
 import com.spikeguard.core.EventType
+import com.spikeguard.core.GuardEvent
 import com.spikeguard.core.MessageBus
+import com.spikeguard.core.PermissionMode
 import com.spikeguard.core.RunMode
 
 /**
@@ -14,6 +18,9 @@ import com.spikeguard.core.RunMode
  * 2. 协调执行保护动作
  * 3. 处理执行结果
  * 4. 管理执行生命周期
+ *
+ * 所有保护动作在独立后台线程执行，不阻塞主线程
+ * 支持暂停/恢复（静默期使用）
  */
 class ExecutionManager(
     private val context: Context,
@@ -23,24 +30,38 @@ class ExecutionManager(
     private val bus = MessageBus.getInstance()
     private var currentExecutor: ActionExecutor? = null
     private var isActive = false
+    private var isPaused = false
+
+    // 后台线程处理所有执行逻辑
+    private var executorThread: HandlerThread? = null
+    private var executorHandler: Handler? = null
 
     // 渐变恢复相关
-    private var fadeOutHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var currentGpuThrottle = 1f
     private var currentCpuThrottle = 1f
     private var targetGpuThrottle = 1f
     private var targetCpuThrottle = 1f
+    private var fadeOutStep = 0
+    private var fadeOutSteps = 10
+    private var fadeOutIntervalMs = 300L
 
     init {
         // 订阅保护事件
         bus.subscribe(EventType.PROTECTION_TRIGGERED) { event ->
-            onProtectionTriggered(event)
+            // 立即投递到后台线程，不阻塞当前线程
+            executorHandler?.post {
+                onProtectionTriggered(event)
+            }
         }
         bus.subscribe(EventType.PROTECTION_RELEASED) { event ->
-            onProtectionReleased(event)
+            executorHandler?.post {
+                onProtectionReleased(event)
+            }
         }
         bus.subscribe(EventType.MODE_CHANGED) { event ->
-            onModeChanged(event)
+            executorHandler?.post {
+                onModeChanged(event)
+            }
         }
     }
 
@@ -50,9 +71,16 @@ class ExecutionManager(
     fun start() {
         if (isActive) return
 
-        // 初始化执行器
-        initializeExecutor()
-        isActive = true
+        // 启动后台线程
+        executorThread = HandlerThread("ExecManager")
+        executorThread?.start()
+        executorHandler = Handler(executorThread!!.looper)
+
+        // 在后台线程初始化执行器
+        executorHandler?.post {
+            initializeExecutor()
+            isActive = true
+        }
     }
 
     /**
@@ -61,20 +89,73 @@ class ExecutionManager(
     fun stop() {
         if (!isActive) return
 
-        // 重置所有设置
-        currentExecutor?.resetAll()
-        currentExecutor?.release()
-        currentExecutor = null
-        isActive = false
+        // 在后台线程执行清理
+        executorHandler?.post {
+            try {
+                currentExecutor?.resetAll()
+                currentExecutor?.release()
+            } catch (e: Exception) {
+                android.util.Log.e(TAG, "Error stopping executor", e)
+            }
+            currentExecutor = null
+            isActive = false
+            isPaused = false
+        }
+
+        // 稍后退出线程（给清理工作一点时间）
+        try {
+            executorThread?.quitSafely()
+        } catch (e: Exception) {
+            // 忽略
+        }
+        executorThread = null
+        executorHandler = null
     }
 
     /**
-     * 初始化执行器
+     * 暂停所有执行（静默期）
+     */
+    fun pause() {
+        isPaused = true
+        android.util.Log.i(TAG, "Execution manager paused (silent mode)")
+
+        executorHandler?.post {
+            // 通知具体执行器暂停
+            (currentExecutor as? ShizukuActionExecutor)?.pause()
+            (currentExecutor as? RootActionExecutor)?.pause()
+        }
+    }
+
+    /**
+     * 恢复执行
+     */
+    fun resume() {
+        isPaused = false
+        android.util.Log.i(TAG, "Execution manager resumed")
+
+        executorHandler?.post {
+            // 通知具体执行器恢复
+            (currentExecutor as? ShizukuActionExecutor)?.resume()
+            (currentExecutor as? RootActionExecutor)?.resume()
+        }
+    }
+
+    /**
+     * 是否处于暂停状态
+     */
+    fun isPaused(): Boolean = isPaused
+
+    /**
+     * 初始化执行器（在后台线程调用）
      */
     private fun initializeExecutor() {
         val runMode = configManager.getRunMode()
 
-        currentExecutor?.release()
+        try {
+            currentExecutor?.release()
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Error releasing old executor", e)
+        }
         currentExecutor = null
 
         currentExecutor = when (runMode) {
@@ -82,39 +163,60 @@ class ExecutionManager(
                 // 根据权限模式选择执行器
                 val permMode = configManager.getPermissionMode()
                 when (permMode) {
-                    com.spikeguard.core.PermissionMode.ROOT -> {
+                    PermissionMode.ROOT -> {
                         val executor = RootActionExecutor()
                         if (executor.isAvailable()) {
-                            executor.initialize()
-                            executor
+                            try {
+                                if (executor.initialize()) {
+                                    executor
+                                } else {
+                                    android.util.Log.w(TAG, "Root init failed, falling back to LogOnly")
+                                    LogOnlyExecutor().also { it.initialize() }
+                                }
+                            } catch (e: Exception) {
+                                android.util.Log.e(TAG, "Root init exception", e)
+                                LogOnlyExecutor().also { it.initialize() }
+                            }
                         } else {
                             android.util.Log.w(TAG, "Root not available, falling back to LogOnly")
                             LogOnlyExecutor().also { it.initialize() }
                         }
                     }
-                    com.spikeguard.core.PermissionMode.SHIZUKU -> {
+                    PermissionMode.SHIZUKU -> {
                         val executor = ShizukuActionExecutor(context)
                         if (executor.isAvailable()) {
-                            executor.initialize()
-                            executor
+                            try {
+                                if (executor.initialize()) {
+                                    executor
+                                } else {
+                                    android.util.Log.w(TAG, "Shizuku init failed, falling back to LogOnly")
+                                    LogOnlyExecutor().also { it.initialize() }
+                                }
+                            } catch (e: Exception) {
+                                android.util.Log.e(TAG, "Shizuku init exception", e)
+                                LogOnlyExecutor().also { it.initialize() }
+                            }
                         } else {
                             android.util.Log.w(TAG, "Shizuku not available, falling back to LogOnly")
                             LogOnlyExecutor().also { it.initialize() }
                         }
                     }
-                    com.spikeguard.core.PermissionMode.NONE -> {
+                    PermissionMode.NONE -> {
                         android.util.Log.w(TAG, "No permission mode set, using LogOnly")
                         LogOnlyExecutor().also { it.initialize() }
                     }
                 }
             }
             RunMode.LOG_ONLY -> {
+                // 纯日志模式：直接使用LogOnlyExecutor，完全不调用Shizuku/Root
+                android.util.Log.i(TAG, "Log only mode - no Shizuku/Root calls will be made")
                 LogOnlyExecutor().also { it.initialize() }
             }
         }
 
         android.util.Log.i(TAG, "Executor initialized: ${currentExecutor?.name}")
 
+        // 发布模式变更
         bus.publish(
             EventType.MODE_CHANGED,
             "run_mode" to runMode.name,
@@ -123,7 +225,7 @@ class ExecutionManager(
     }
 
     /**
-     * 保护触发处理
+     * 保护触发处理（在后台线程调用）
      *
      * 完整保护流程：
      * 1. 回收空闲内存
@@ -132,15 +234,20 @@ class ExecutionManager(
      * 4. 提升进程优先级
      * 5. 帧率限制（可选）
      */
-    private fun onProtectionTriggered(event: com.spikeguard.core.GuardEvent) {
+    private fun onProtectionTriggered(event: GuardEvent) {
         val executor = currentExecutor ?: return
+
+        // 暂停状态下不执行保护
+        if (isPaused) {
+            android.util.Log.w(TAG, "Protection skipped: paused (silent mode)")
+            return
+        }
 
         val sceneId = event.data["scene_id"] as? String ?: "unknown"
         val sceneName = event.data["scene_name"] as? String ?: "未知场景"
         val cpuThrottle = event.data["cpu_throttle"] as? Float ?: 0.7f
         val gpuThrottle = event.data["gpu_throttle"] as? Float ?: 0.6f
         val frameLimit = event.data["frame_limit"] as? Int ?: 30
-        val durationMs = event.data["duration_ms"] as? Long ?: 8000
         val reclaimMemory = event.data["reclaim_memory"] as? Boolean ?: true
         val boostPriority = event.data["boost_priority"] as? Boolean ?: true
         val logOnly = event.data["log_only"] as? Boolean ?: false
@@ -151,11 +258,10 @@ class ExecutionManager(
                     "gpu=${(gpuThrottle * 100).toInt()}%, " +
                     "cpu=${(cpuThrottle * 100).toInt()}%, " +
                     "boost_priority=$boostPriority, " +
-                    "duration=${durationMs}ms, " +
                     "log_only=$logOnly")
 
-        if (logOnly) {
-            // 纯日志模式，不执行实际动作
+        // 如果是log_only模式，直接记录日志，不调用执行器
+        if (logOnly || executor is LogOnlyExecutor) {
             android.util.Log.i(TAG, "[LOG ONLY] Protection would be triggered for $sceneName")
             bus.publish(
                 EventType.ACTION_EXECUTED,
@@ -169,22 +275,22 @@ class ExecutionManager(
 
         // 步骤1: 回收内存
         val memoryResult = if (reclaimMemory) {
-            executor.reclaimMemory()
+            safeExecute { executor.reclaimMemory() }
         } else {
             ActionResult(ActionType.RECLAIM_MEMORY, true, "Skipped")
         }
 
         // 步骤2: GPU钳制
-        val gpuResult = executor.setGpuThrottle(gpuThrottle)
+        val gpuResult = safeExecute { executor.setGpuThrottle(gpuThrottle) }
 
         // 步骤3: CPU钳制
-        val cpuResult = executor.setCpuThrottle(cpuThrottle)
+        val cpuResult = safeExecute { executor.setCpuThrottle(cpuThrottle) }
 
         // 步骤4: 提升进程优先级（针对原神）
         val priorityResult = if (boostPriority) {
             val genshinPackage = detectGenshinPackage()
             if (genshinPackage != null) {
-                executor.boostProcessPriority(genshinPackage)
+                safeExecute { executor.boostProcessPriority(genshinPackage) }
             } else {
                 ActionResult(ActionType.BOOST_PRIORITY, false, "Genshin process not found")
             }
@@ -192,8 +298,8 @@ class ExecutionManager(
             ActionResult(ActionType.BOOST_PRIORITY, true, "Skipped")
         }
 
-        // 步骤5: 帧率限制（可选）
-        val frameResult = executor.setFrameLimit(frameLimit)
+        // 步骤5: 帧率限制
+        val frameResult = safeExecute { executor.setFrameLimit(frameLimit) }
 
         currentCpuThrottle = cpuThrottle
         currentGpuThrottle = gpuThrottle
@@ -216,23 +322,42 @@ class ExecutionManager(
     }
 
     /**
-     * 保护解除处理 - 带渐变恢复
+     * 安全执行：捕获所有异常，不向外抛出
      */
-    private fun onProtectionReleased(event: com.spikeguard.core.GuardEvent) {
+    private fun safeExecute(block: () -> ActionResult): ActionResult {
+        return try {
+            block()
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Execution error", e)
+            ActionResult(ActionType.CPU_THROTTLE, false, "Exception: ${e.message}")
+        }
+    }
+
+    /**
+     * 保护解除处理 - 带渐变恢复（在后台线程调用）
+     */
+    private fun onProtectionReleased(event: GuardEvent) {
         val executor = currentExecutor ?: return
 
+        // 暂停状态下直接重置
+        if (isPaused) {
+            android.util.Log.w(TAG, "Protection release in paused mode, resetting immediately")
+            safeExecute { executor.resetAll() }
+            currentCpuThrottle = 1f
+            currentGpuThrottle = 1f
+            return
+        }
+
         val fadeOutMs = event.data["fade_out_ms"] as? Long ?: 3000
-        val sceneId = event.data["scene_id"] as? String ?: "unknown"
 
-        android.util.Log.i(TAG, "Releasing protection for scene=$sceneId, fadeOut=${fadeOutMs}ms")
+        android.util.Log.i(TAG, "Releasing protection, fadeOut=${fadeOutMs}ms")
 
-        // 渐变恢复到正常状态
         targetCpuThrottle = 1f
         targetGpuThrottle = 1f
 
         if (fadeOutMs <= 0) {
             // 立即恢复
-            executor.resetAll()
+            safeExecute { executor.resetAll() }
             currentCpuThrottle = 1f
             currentGpuThrottle = 1f
         } else {
@@ -242,34 +367,36 @@ class ExecutionManager(
     }
 
     /**
-     * 渐变恢复
+     * 渐变恢复（在后台线程）
      */
     private fun startFadeOut(durationMs: Long) {
-        val steps = 10
-        val stepInterval = durationMs / steps
+        fadeOutSteps = 10
+        fadeOutIntervalMs = durationMs / fadeOutSteps
         val startCpu = currentCpuThrottle
         val startGpu = currentGpuThrottle
-        var step = 0
-
-        fadeOutHandler.removeCallbacksAndMessages(null)
+        fadeOutStep = 0
 
         val fadeRunnable = object : Runnable {
             override fun run() {
-                step++
-                val progress = step.toFloat() / steps
+                fadeOutStep++
+                val progress = fadeOutStep.toFloat() / fadeOutSteps
 
                 currentCpuThrottle = startCpu + (targetCpuThrottle - startCpu) * progress
                 currentGpuThrottle = startGpu + (targetGpuThrottle - startGpu) * progress
 
                 // 应用中间值
-                currentExecutor?.setCpuThrottle(currentCpuThrottle)
-                currentExecutor?.setGpuThrottle(currentGpuThrottle)
+                currentExecutor?.let { exec ->
+                    safeExecute { exec.setCpuThrottle(currentCpuThrottle) }
+                    safeExecute { exec.setGpuThrottle(currentGpuThrottle) }
+                }
 
-                if (step < steps) {
-                    fadeOutHandler.postDelayed(this, stepInterval)
+                if (fadeOutStep < fadeOutSteps) {
+                    executorHandler?.postDelayed(this, fadeOutIntervalMs)
                 } else {
                     // 完成，完全恢复
-                    currentExecutor?.resetAll()
+                    currentExecutor?.let { exec ->
+                        safeExecute { exec.resetAll() }
+                    }
                     currentCpuThrottle = 1f
                     currentGpuThrottle = 1f
                     android.util.Log.i(TAG, "Fade out complete")
@@ -277,14 +404,13 @@ class ExecutionManager(
             }
         }
 
-        fadeOutHandler.postDelayed(fadeRunnable, stepInterval)
+        executorHandler?.postDelayed(fadeRunnable, fadeOutIntervalMs)
     }
 
     /**
-     * 模式变更处理
+     * 模式变更处理（在后台线程）
      */
-    private fun onModeChanged(event: com.spikeguard.core.GuardEvent) {
-        // 重新初始化执行器
+    private fun onModeChanged(event: GuardEvent) {
         if (isActive) {
             initializeExecutor()
         }
@@ -301,7 +427,7 @@ class ExecutionManager(
     fun isActive(): Boolean = isActive
 
     /**
-     * 检测原神包名
+     * 检测原神包名（不使用Root/Shizuku，纯ActivityManager方式）
      * 尝试多个可能的包名，返回第一个找到的
      */
     private fun detectGenshinPackage(): String? {
@@ -313,14 +439,16 @@ class ExecutionManager(
 
         for (pkg in possiblePackages) {
             try {
-                val process = Runtime.getRuntime().exec("pidof $pkg")
-                val output = process.inputStream.bufferedReader().readText().trim()
-                process.waitFor()
-                if (output.isNotEmpty()) {
-                    return pkg
+                // 使用 ActivityManager 获取运行中进程（不需要Root/Shizuku）
+                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                val runningApps = am.runningAppProcesses
+                for (processInfo in runningApps) {
+                    if (processInfo.processName == pkg) {
+                        return pkg
+                    }
                 }
             } catch (e: Exception) {
-                // 继续尝试下一个
+                // 忽略，继续尝试
             }
         }
         return null

@@ -25,6 +25,7 @@ enum class EventType {
     SERVICE_STARTED,          // 服务启动
     SERVICE_STOPPED,          // 服务停止
     HEARTBEAT,                // 心跳
+    SILENT_MODE_CHANGED,      // 静默模式变化
 
     // UI事件
     UI_STATE_UPDATE,          // UI状态更新

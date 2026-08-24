@@ -31,16 +31,38 @@ abstract class BaseCollector {
 
     protected val bus = MessageBus.getInstance()
     protected var running = false
+    protected var paused = false
     protected var sampleIntervalMs: Long = 500
 
     open fun start(intervalMs: Long) {
         sampleIntervalMs = intervalMs
         running = true
+        paused = false
     }
 
     open fun stop() {
         running = false
+        paused = false
     }
+
+    /**
+     * 暂停采集（静默期使用）
+     */
+    open fun pause() {
+        paused = true
+    }
+
+    /**
+     * 恢复采集
+     */
+    open fun resume() {
+        paused = false
+    }
+
+    /**
+     * 是否暂停
+     */
+    fun isPaused(): Boolean = paused
 
     protected fun publishMetrics(sample: MetricsSample) {
         bus.publish(

@@ -203,6 +203,15 @@
                     android:layout_height="wrap_content"
                     android:text="运行模式: 仅日志"
                     android:textSize="14sp"/>
+
+                <TextView
+                    android:id="@+id/tvPermissionStatus"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="权限状态: 检测中..."
+                    android:textSize="12sp"
+                    android:textColor="@color/text_secondary"
+                    android:layout_marginTop="4dp"/>
             </LinearLayout>
         </androidx.cardview.widget.CardView>
 

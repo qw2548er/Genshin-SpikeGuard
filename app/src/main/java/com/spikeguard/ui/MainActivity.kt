@@ -19,6 +19,7 @@ import com.spikeguard.core.PermissionMode
 import com.spikeguard.core.RunMode
 import com.spikeguard.service.GuardService
 import com.spikeguard.util.LogManager
+import com.spikeguard.util.PermissionStatusChecker
 
 /**
  * 主界面 Activity
@@ -46,6 +47,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvRiskLevel: TextView
     private lateinit var tvProtections: TextView
     private lateinit var tvMode: TextView
+    private lateinit var tvPermissionStatus: TextView
 
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
@@ -59,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnClearLog: Button
 
     private var serviceRunning = false
+    private lateinit var permissionChecker: PermissionStatusChecker
 
     companion object {
         private const val REQUEST_CODE_IMPORT_CONFIG = 1001
@@ -73,11 +76,17 @@ class MainActivity : AppCompatActivity() {
         configManager = ConfigManager(this)
         configManager.loadConfig()
 
+        // 初始化权限检测器
+        permissionChecker = PermissionStatusChecker(this)
+
         // 初始化 UI
         initViews()
 
         // 加载设置
         loadSettings()
+
+        // 检测权限状态（异步，不阻塞主线程）
+        checkPermissionStatus()
 
         // 订阅 UI 更新事件
         bus.subscribe(EventType.UI_STATE_UPDATE) { event ->
@@ -119,6 +128,7 @@ class MainActivity : AppCompatActivity() {
         tvRiskLevel = findViewById(R.id.tvRiskLevel)
         tvProtections = findViewById(R.id.tvProtections)
         tvMode = findViewById(R.id.tvMode)
+        tvPermissionStatus = findViewById(R.id.tvPermissionStatus)
 
         btnStart = findViewById(R.id.btnStart)
         btnStop = findViewById(R.id.btnStop)
@@ -157,6 +167,7 @@ class MainActivity : AppCompatActivity() {
             val mode = if (isChecked) PermissionMode.ROOT else PermissionMode.SHIZUKU
             configManager.setPermissionMode(mode)
             updatePermissionDisplay()
+            checkPermissionStatus()
 
             if (serviceRunning) {
                 val intent = Intent(this, GuardService::class.java).apply {
@@ -223,6 +234,32 @@ class MainActivity : AppCompatActivity() {
             PermissionMode.ROOT -> "Root 模式"
             PermissionMode.SHIZUKU -> "Shizuku 模式"
             PermissionMode.NONE -> "无权限"
+        }
+    }
+
+    /**
+     * 检测权限状态（异步，不阻塞主线程）
+     */
+    private fun checkPermissionStatus() {
+        val runMode = configManager.getRunMode()
+        if (runMode == RunMode.LOG_ONLY) {
+            tvPermissionStatus.text = "权限状态: 纯日志模式（无需权限）"
+            tvPermissionStatus.setTextColor(getColor(R.color.text_secondary))
+            return
+        }
+
+        val permMode = configManager.getPermissionMode()
+        tvPermissionStatus.text = "权限状态: 检测中..."
+        tvPermissionStatus.setTextColor(getColor(R.color.text_secondary))
+
+        permissionChecker.checkPermissionStatus(permMode) { status ->
+            if (status.available) {
+                tvPermissionStatus.text = "权限状态: ${status.message}"
+                tvPermissionStatus.setTextColor(getColor(R.color.good))
+            } else {
+                tvPermissionStatus.text = "权限状态: ${status.message}"
+                tvPermissionStatus.setTextColor(getColor(R.color.danger))
+            }
         }
     }
 
@@ -499,6 +536,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // 释放权限检测器资源
+        try {
+            permissionChecker.release()
+        } catch (e: Exception) {
+            // 忽略
+        }
         // 注意：不停止总线，因为服务可能还在运行
     }
 }

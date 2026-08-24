@@ -1,11 +1,14 @@
 package com.spikeguard.service
 
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -26,6 +29,7 @@ import com.spikeguard.executor.ExecutionManager
  * 1. 启动并管理采集、决策、执行模块
  * 2. 维持前台服务状态，降低被系统杀死的概率
  * 3. 心跳检测，自我恢复
+ * 4. 原神启动静默期管理
  */
 class GuardService : Service() {
 
@@ -35,12 +39,16 @@ class GuardService : Service() {
     private lateinit var decisionEngine: DecisionEngine
     private lateinit var executionManager: ExecutionManager
 
-    private var heartbeatHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    // 心跳使用主线程（轻量操作）
+    private var heartbeatHandler = Handler(android.os.Looper.getMainLooper())
     private var heartbeatCount = 0L
 
-    // 原神进程监控 - 用于启动静默期
-    private var genshinMonitorHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private var genshinWasRunning = false
+    // 原神进程监控 - 使用独立后台线程，避免阻塞主线程导致ANR
+    private var monitorThread: HandlerThread? = null
+    private var monitorHandler: Handler? = null
+    @Volatile private var genshinWasRunning = false
+    @Volatile private var silentModeActive = false
+    private var silentModeEndTime = 0L
     private val genshinPackages = listOf(
         "com.miHoYo.GenshinImpact",
         "com.miHoYo.Yuanshen",
@@ -53,30 +61,104 @@ class GuardService : Service() {
             bus.publish(
                 EventType.HEARTBEAT,
                 "count" to heartbeatCount,
-                "uptime_ms" to (System.currentTimeMillis() - startTime)
+                "uptime_ms" to (System.currentTimeMillis() - startTime),
+                "silent_mode" to silentModeActive
             )
             heartbeatHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
         }
     }
 
     /**
-     * 原神进程监控Runnable
-     * 检测原神启动时进入静默模式，避开反作弊初始化扫描
+     * 原神进程监控Runnable（在后台线程运行）
+     * 检测原神启动时进入静默模式，暂停所有Shizuku/Root调用
      */
     private val genshinMonitorRunnable = object : Runnable {
         override fun run() {
-            val isRunning = isGenshinRunning()
-
-            if (isRunning && !genshinWasRunning) {
-                // 原神刚启动，进入静默模式
-                val silenceMs = configManager.getGenshinSilenceMs()
-                Log.i(TAG, "Genshin detected! Entering silent mode for ${silenceMs}ms")
-                decisionEngine.enterSilentMode(silenceMs)
+            try {
+                checkGenshinAndSilence()
+            } catch (e: Exception) {
+                Log.e(TAG, "Genshin monitor error", e)
+            } finally {
+                // 无论成功失败，都调度下一次检查
+                monitorHandler?.postDelayed(this, GENSHIN_MONITOR_INTERVAL_MS)
             }
-
-            genshinWasRunning = isRunning
-            genshinMonitorHandler.postDelayed(this, GENSHIN_MONITOR_INTERVAL_MS)
         }
+    }
+
+    /**
+     * 检查原神状态并管理静默期
+     */
+    private fun checkGenshinAndSilence() {
+        val isRunning = isGenshinRunningSafe()
+
+        if (isRunning && !genshinWasRunning) {
+            // 原神刚启动，进入静默模式
+            val silenceMs = configManager.getGenshinSilenceMs()
+            Log.i(TAG, "Genshin startup detected! Entering silent mode for ${silenceMs}ms")
+            enterSilentMode(silenceMs)
+        }
+
+        genshinWasRunning = isRunning
+
+        // 检查静默期是否结束
+        if (silentModeActive && System.currentTimeMillis() >= silentModeEndTime) {
+            exitSilentMode()
+        }
+    }
+
+    /**
+     * 进入静默模式
+     */
+    private fun enterSilentMode(durationMs: Long) {
+        silentModeActive = true
+        silentModeEndTime = System.currentTimeMillis() + durationMs
+
+        // 暂停采集器（停止一切数据采集）
+        collector.pause()
+
+        // 暂停执行器（停止所有Shizuku/Root调用）
+        executionManager.pause()
+
+        // 通知决策引擎进入静默
+        decisionEngine.enterSilentMode(durationMs)
+
+        // 更新通知
+        updateNotification("静默中 - 原神启动保护")
+
+        // 发布静默模式事件
+        bus.publish(
+            EventType.SILENT_MODE_CHANGED,
+            "active" to true,
+            "duration_ms" to durationMs,
+            "reason" to "genshin_startup"
+        )
+
+        Log.i(TAG, "Silent mode activated for ${durationMs}ms - all collection & control paused")
+    }
+
+    /**
+     * 退出静默模式
+     */
+    private fun exitSilentMode() {
+        silentModeActive = false
+
+        // 恢复采集器
+        collector.resume()
+
+        // 恢复执行器
+        executionManager.resume()
+
+        // 更新通知
+        updateNotification("运行中 - 保护已启用")
+
+        // 发布静默模式事件
+        bus.publish(
+            EventType.SILENT_MODE_CHANGED,
+            "active" to false,
+            "reason" to "timeout"
+        )
+
+        Log.i(TAG, "Silent mode deactivated - collection & control resumed")
     }
 
     private var startTime = 0L
@@ -119,8 +201,8 @@ class GuardService : Service() {
         // 启动心跳
         heartbeatHandler.post(heartbeatRunnable)
 
-        // 启动原神进程监控
-        genshinMonitorHandler.post(genshinMonitorRunnable)
+        // 启动原神进程监控（在独立后台线程）
+        startGenshinMonitor()
 
         // 发布服务启动事件
         bus.publish(
@@ -161,7 +243,7 @@ class GuardService : Service() {
         heartbeatHandler.removeCallbacksAndMessages(null)
 
         // 停止原神进程监控
-        genshinMonitorHandler.removeCallbacksAndMessages(null)
+        stopGenshinMonitor()
 
         // 停止所有模块
         stopModules()
@@ -205,6 +287,50 @@ class GuardService : Service() {
         stopModules()
         configManager.loadConfig()
         startModules()
+    }
+
+    /**
+     * 启动原神监控后台线程
+     */
+    private fun startGenshinMonitor() {
+        monitorThread = HandlerThread("GenshinMonitor")
+        monitorThread?.start()
+        monitorHandler = Handler(monitorThread!!.looper)
+        monitorHandler?.post(genshinMonitorRunnable)
+    }
+
+    /**
+     * 停止原神监控
+     */
+    private fun stopGenshinMonitor() {
+        try {
+            monitorHandler?.removeCallbacksAndMessages(null)
+            monitorThread?.quitSafely()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping genshin monitor", e)
+        }
+        monitorThread = null
+        monitorHandler = null
+    }
+
+    /**
+     * 安全检测原神是否在运行（使用ActivityManager，不需要Root/Shizuku）
+     * 完全不会触发ANR
+     */
+    private fun isGenshinRunningSafe(): Boolean {
+        return try {
+            val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+            val runningApps = am.runningAppProcesses ?: return false
+            for (processInfo in runningApps) {
+                if (genshinPackages.contains(processInfo.processName)) {
+                    return true
+                }
+            }
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to check genshin running state", e)
+            false
+        }
     }
 
     /**
@@ -270,27 +396,12 @@ class GuardService : Service() {
      * 更新通知
      */
     private fun updateNotification(text: String) {
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(NOTIFICATION_ID, createNotification(text))
-    }
-
-    /**
-     * 检测原神是否在运行
-     */
-    private fun isGenshinRunning(): Boolean {
-        for (pkg in genshinPackages) {
-            try {
-                val process = Runtime.getRuntime().exec("pidof $pkg")
-                val output = process.inputStream.bufferedReader().readText().trim()
-                process.waitFor()
-                if (output.isNotEmpty()) {
-                    return true
-                }
-            } catch (e: Exception) {
-                // 继续尝试下一个
-            }
+        try {
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.notify(NOTIFICATION_ID, createNotification(text))
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update notification", e)
         }
-        return false
     }
 
     companion object {

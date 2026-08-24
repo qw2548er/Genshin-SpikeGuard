@@ -40,9 +40,11 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
         scope.launch {
             while (running && isActive) {
                 try {
-                    val sample = collectSample()
-                    publishMetrics(sample)
-                    checkGpuSpike(sample)
+                    if (!paused) {
+                        val sample = collectSample()
+                        publishMetrics(sample)
+                        checkGpuSpike(sample)
+                    }
                     delay(sampleIntervalMs)
                 } catch (e: Exception) {
                     android.util.Log.e(TAG, "Sampling error", e)
