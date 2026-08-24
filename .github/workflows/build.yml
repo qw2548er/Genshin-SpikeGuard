@@ -25,21 +25,24 @@ jobs:
 
       - name: Configure Android SDK
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
           echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
-          cat local.properties
           yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
           $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Generate debug keystore for release signing
+        run: |
+          mkdir -p ~/.android
+          keytool -genkey -v -keystore ~/.android/debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US" || true
+          ls -la ~/.android/debug.keystore
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
       - name: Build Debug APK
-        run: |
-          ./gradlew assembleDebug --info 2>&1 | tail -100
-          echo "---"
-          echo "Exit code: $?"
+        run: ./gradlew assembleDebug
 
       - name: Build Release APK
         run: ./gradlew assembleRelease
@@ -77,6 +80,14 @@ jobs:
           echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
           yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
           $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Generate debug keystore for release signing
+        run: |
+          mkdir -p ~/.android
+          keytool -genkey -v -keystore ~/.android/debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US" || true
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew

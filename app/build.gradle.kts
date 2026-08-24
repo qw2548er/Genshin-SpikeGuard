@@ -21,7 +21,8 @@ android {
         create("release") {
             // 使用 debug keystore 进行 CI 构建
             // 正式发布请替换为正式签名
-            val debugStoreFile = file("${System.getenv("ANDROID_SDK_ROOT") ?: ""}/.android/debug.keystore")
+            val userHome = System.getProperty("user.home")
+            val debugStoreFile = file("$userHome/.android/debug.keystore")
             if (debugStoreFile.exists()) {
                 storeFile = debugStoreFile
                 storePassword = "android"
