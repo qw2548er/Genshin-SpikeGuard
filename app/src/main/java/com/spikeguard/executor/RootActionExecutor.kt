@@ -138,6 +138,51 @@ class RootActionExecutor : ActionExecutor {
         }
     }
 
+    override fun reclaimMemory(): ActionResult {
+        return try {
+            var reclaimed = 0
+
+            // 方法1: 清理后台进程缓存
+            executeCommand("echo 3 > /proc/sys/vm/drop_caches")
+            reclaimed += 1
+
+            // 方法2: 压缩内存（如果支持）
+            executeCommand("echo 1 > /proc/sys/vm/compact_memory")
+            reclaimed += 1
+
+            // 方法3: 杀掉低优先级后台进程
+            executeCommand("am kill-all background")
+            reclaimed += 1
+
+            ActionResult(ActionType.RECLAIM_MEMORY, true,
+                "Memory reclaimed ($reclaimed methods applied)")
+        } catch (e: Exception) {
+            ActionResult(ActionType.RECLAIM_MEMORY, false, e.message ?: "Unknown error")
+        }
+    }
+
+    override fun boostProcessPriority(packageName: String): ActionResult {
+        return try {
+            // 方法1: 设置进程oom_adj为较低值（更难被杀死）
+            val pid = getPidByPackage(packageName)
+            if (pid > 0) {
+                // 设置oom_adj_score为-1000（最高优先级）
+                executeCommand("echo -1000 > /proc/$pid/oom_score_adj")
+
+                // 设置进程优先级为高优先级
+                executeCommand("renice -10 -p $pid")
+
+                ActionResult(ActionType.BOOST_PRIORITY, true,
+                    "Priority boosted for $packageName (pid=$pid)")
+            } else {
+                ActionResult(ActionType.BOOST_PRIORITY, false,
+                    "Process not found: $packageName")
+            }
+        } catch (e: Exception) {
+            ActionResult(ActionType.BOOST_PRIORITY, false, e.message ?: "Unknown error")
+        }
+    }
+
     override fun resetAll(): ActionResult {
         return try {
             // 恢复所有原始值
@@ -232,6 +277,20 @@ class RootActionExecutor : ActionExecutor {
             Runtime.getRuntime().availableProcessors()
         } catch (e: Exception) {
             8
+        }
+    }
+
+    /**
+     * 通过包名获取进程PID
+     */
+    private fun getPidByPackage(packageName: String): Int {
+        return try {
+            val process = Runtime.getRuntime().exec("su -c pidof $packageName")
+            val output = process.inputStream.bufferedReader().readText().trim()
+            process.waitFor()
+            output.split(" ").firstOrNull()?.toIntOrNull() ?: 0
+        } catch (e: Exception) {
+            0
         }
     }
 

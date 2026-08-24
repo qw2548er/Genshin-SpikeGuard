@@ -49,6 +49,24 @@ class LogOnlyExecutor : ActionExecutor {
         )
     }
 
+    override fun reclaimMemory(): ActionResult {
+        Log.i(TAG, "[LOG ONLY] Would reclaim memory (drop caches, compact, kill background)")
+        return ActionResult(
+            ActionType.RECLAIM_MEMORY,
+            true,
+            "Log only: Memory reclaimed"
+        )
+    }
+
+    override fun boostProcessPriority(packageName: String): ActionResult {
+        Log.i(TAG, "[LOG ONLY] Would boost priority for $packageName")
+        return ActionResult(
+            ActionType.BOOST_PRIORITY,
+            true,
+            "Log only: Priority boosted for $packageName"
+        )
+    }
+
     override fun resetAll(): ActionResult {
         Log.i(TAG, "[LOG ONLY] Would reset all settings")
         return ActionResult(

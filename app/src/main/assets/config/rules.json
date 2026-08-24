@@ -1,101 +1,276 @@
 {
-  "version": "1.0.0",
+  "version": "0.1.0",
   "general": {
     "run_mode": "log_only",
     "permission_mode": "none",
-    "sample_interval_ms": 500,
+    "sample_interval_ms": 200,
     "heartbeat_interval_ms": 3000,
-    "protection_cooldown_ms": 5000
+    "protection_window_ms": 1500,
+    "fade_out_ms": 200
+  },
+  "protection_flow": {
+    "steps": [
+      "detect_battle_settlement",
+      "reclaim_memory",
+      "throttle_gpu_peak",
+      "boost_process_priority",
+      "restore_all"
+    ],
+    "total_duration_ms": 1500,
+    "unconditional_restore": true
+  },
+  "scene_categories": {
+    "skip_protection": {
+      "name": "跳过强保护（仅日志）",
+      "description": "低风险区域，仅记录数据不执行任何保护动作",
+      "scenes": [
+        "mondstadt",
+        "liyue",
+        "inazuma",
+        "sumeru",
+        "mondstadt_dungeon",
+        "liyue_dungeon",
+        "inazuma_dungeon",
+        "sumeru_dungeon"
+      ]
+    },
+    "gentle_monitor": {
+      "name": "温和监控（仅日志）",
+      "description": "中等风险区域，监控但不干预",
+      "scenes": [
+        "fontaine_open_world",
+        "natlan_open_world",
+        "nordkarelen_open_world",
+        "snezhnaya_open_world"
+      ]
+    },
+    "full_protection": {
+      "name": "全套尖峰防护",
+      "description": "高风险场景，触发1500ms完整保护窗口",
+      "scenes": [
+        "all_domains",
+        "gun_limit_challenge",
+        "thousand_star_domain",
+        "new_nation_dungeon"
+      ]
+    }
   },
   "scenes": {
+    "mondstadt": {
+      "name": "蒙德",
+      "category": "skip_protection",
+      "enabled": true,
+      "description": "蒙德大世界（含地下子副本）",
+      "detection": {
+        "gpu_load_baseline": 40,
+        "entity_baseline": 10
+      }
+    },
+    "liyue": {
+      "name": "璃月",
+      "category": "skip_protection",
+      "enabled": true,
+      "description": "璃月大世界（含地下子副本）",
+      "detection": {
+        "gpu_load_baseline": 45,
+        "entity_baseline": 15
+      }
+    },
+    "inazuma": {
+      "name": "稻妻",
+      "category": "skip_protection",
+      "enabled": true,
+      "description": "稻妻大世界（含地下子副本）",
+      "detection": {
+        "gpu_load_baseline": 50,
+        "entity_baseline": 15
+      }
+    },
+    "sumeru": {
+      "name": "须弥",
+      "category": "skip_protection",
+      "enabled": true,
+      "description": "须弥大世界（含地下子副本）",
+      "detection": {
+        "gpu_load_baseline": 55,
+        "entity_baseline": 20
+      }
+    },
+    "fontaine_open_world": {
+      "name": "枫丹大世界",
+      "category": "gentle_monitor",
+      "enabled": true,
+      "description": "枫丹普通大世界，温和监控不干预",
+      "detection": {
+        "gpu_load_baseline": 55,
+        "entity_baseline": 25
+      }
+    },
+    "natlan_open_world": {
+      "name": "纳塔大世界",
+      "category": "gentle_monitor",
+      "enabled": true,
+      "description": "纳塔普通大世界，温和监控不干预",
+      "detection": {
+        "gpu_load_baseline": 60,
+        "entity_baseline": 30
+      }
+    },
+    "nordkarelen_open_world": {
+      "name": "挪德卡莱大世界",
+      "category": "gentle_monitor",
+      "enabled": true,
+      "description": "挪德卡莱普通大世界，温和监控不干预",
+      "detection": {
+        "gpu_load_baseline": 55,
+        "entity_baseline": 25
+      }
+    },
+    "snezhnaya_open_world": {
+      "name": "至冬大世界",
+      "category": "gentle_monitor",
+      "enabled": true,
+      "description": "至冬普通大世界，温和监控不干预",
+      "detection": {
+        "gpu_load_baseline": 50,
+        "entity_baseline": 20
+      }
+    },
     "gun_limit_challenge": {
       "name": "枪限挑战",
-      "description": "大量敌人同时生成与销毁的高压力场景",
+      "category": "full_protection",
       "enabled": true,
+      "description": "大量敌人同时生成与销毁的超高压力场景",
       "detection": {
         "entity_rate_threshold": 20,
-        "spike_window_ms": 3000,
-        "consecutive_spikes": 3
+        "spike_window_ms": 2000,
+        "consecutive_spikes": 2,
+        "fps_drop_threshold": 40,
+        "battle_settlement_pattern": true
       },
       "protection": {
-        "cpu_throttle": 0.7,
-        "gpu_throttle": 0.6,
-        "frame_limit": 30,
-        "duration_ms": 8000,
-        "fade_out_ms": 3000
+        "reclaim_memory": true,
+        "gpu_throttle": 0.5,
+        "cpu_throttle": 0.6,
+        "boost_priority": true,
+        "duration_ms": 1500,
+        "unconditional_restore": true
       },
       "risk_mitigation": {
-        "max_daily_triggers": 50,
-        "cooldown_after_max": 3600000,
-        "gradual_escalation": true
+        "max_daily_triggers": 100,
+        "min_interval_ms": 3000
       }
     },
     "thousand_star_domain": {
       "name": "千星奇域",
-      "description": "大量特效和实体的高渲染压力场景",
+      "category": "full_protection",
       "enabled": true,
+      "description": "大量特效和实体的高渲染压力场景",
       "detection": {
         "entity_rate_threshold": 15,
-        "spike_window_ms": 2000,
-        "consecutive_spikes": 2
+        "spike_window_ms": 1500,
+        "consecutive_spikes": 2,
+        "fps_drop_threshold": 35,
+        "battle_settlement_pattern": true
       },
       "protection": {
-        "cpu_throttle": 0.75,
-        "gpu_throttle": 0.65,
-        "frame_limit": 45,
-        "duration_ms": 6000,
-        "fade_out_ms": 2000
+        "reclaim_memory": true,
+        "gpu_throttle": 0.55,
+        "cpu_throttle": 0.65,
+        "boost_priority": true,
+        "duration_ms": 1500,
+        "unconditional_restore": true
       },
       "risk_mitigation": {
-        "max_daily_triggers": 80,
-        "cooldown_after_max": 1800000,
-        "gradual_escalation": true
+        "max_daily_triggers": 150,
+        "min_interval_ms": 2000
       }
     },
     "new_nation_dungeon": {
       "name": "新国家副本",
-      "description": "新区域副本中大规模战斗场景",
+      "category": "full_protection",
       "enabled": true,
+      "description": "新区域副本中大规模战斗结算场景",
       "detection": {
         "entity_rate_threshold": 25,
-        "spike_window_ms": 4000,
-        "consecutive_spikes": 4
+        "spike_window_ms": 2500,
+        "consecutive_spikes": 3,
+        "fps_drop_threshold": 45,
+        "battle_settlement_pattern": true
       },
       "protection": {
-        "cpu_throttle": 0.65,
-        "gpu_throttle": 0.55,
-        "frame_limit": 30,
-        "duration_ms": 10000,
-        "fade_out_ms": 4000
+        "reclaim_memory": true,
+        "gpu_throttle": 0.45,
+        "cpu_throttle": 0.55,
+        "boost_priority": true,
+        "duration_ms": 1500,
+        "unconditional_restore": true
       },
       "risk_mitigation": {
-        "max_daily_triggers": 30,
-        "cooldown_after_max": 7200000,
-        "gradual_escalation": true
+        "max_daily_triggers": 60,
+        "min_interval_ms": 4000
+      }
+    },
+    "all_domains": {
+      "name": "各国秘境副本",
+      "category": "full_protection",
+      "enabled": true,
+      "description": "通用秘境副本战斗结算场景",
+      "detection": {
+        "entity_rate_threshold": 18,
+        "spike_window_ms": 2000,
+        "consecutive_spikes": 2,
+        "fps_drop_threshold": 38,
+        "battle_settlement_pattern": true
+      },
+      "protection": {
+        "reclaim_memory": true,
+        "gpu_throttle": 0.55,
+        "cpu_throttle": 0.65,
+        "boost_priority": true,
+        "duration_ms": 1500,
+        "unconditional_restore": true
+      },
+      "risk_mitigation": {
+        "max_daily_triggers": 200,
+        "min_interval_ms": 2000
       }
     }
   },
   "gpu_monitor": {
     "spike_threshold_percent": 85,
-    "baseline_window_ms": 10000,
-    "spike_cooldown_ms": 2000
+    "baseline_window_ms": 8000,
+    "spike_cooldown_ms": 1500,
+    "settlement_rapid_drop": true
   },
   "frame_monitor": {
     "drop_threshold_percent": 40,
     "min_fps": 15,
-    "drop_window_ms": 1000
+    "drop_window_ms": 800,
+    "settlement_fps_rebound": true
+  },
+  "battle_settlement_detection": {
+    "enabled": true,
+    "description": "战斗结算前兆检测：实体数骤降+GPU尖峰+帧率反弹的组合特征",
+    "entity_drop_ratio": 0.6,
+    "entity_drop_window_ms": 500,
+    "gpu_spike_before_drop": true,
+    "fps_rebound_after_drop": true,
+    "min_entities_before_drop": 30
   },
   "risk_mitigation": {
     "account_safety_level": "normal",
-    "max_protections_per_hour": 20,
-    "min_interval_between_protections_ms": 2000,
-    "warning_threshold_count": 10,
-    "auto_slow_down_after_warnings": true
+    "genshin_start_silence_ms": 10000,
+    "max_protections_per_hour": 30,
+    "min_interval_between_protections_ms": 1500,
+    "read_only_proc": true,
+    "no_game_memory_access": true
   },
   "logging": {
     "level": "INFO",
     "max_log_size_mb": 50,
     "log_to_file": true,
-    "include_metrics": true
+    "include_metrics": true,
+    "include_protection_events": true
   }
 }

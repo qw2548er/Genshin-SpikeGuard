@@ -22,117 +22,22 @@ enum class PermissionMode {
 }
 
 /**
- * 配置管理器
+ * 配置管理器 v0.1.0
+ *
  * 所有场景、阈值全部外置，后续游戏版本更新只改配置
  */
 class ConfigManager(private val context: Context) {
 
     private var config: JSONObject = JSONObject()
 
-    // 默认配置
-    private val defaultConfig = """
-        {
-          "version": "1.0.0",
-          "general": {
-            "run_mode": "log_only",
-            "permission_mode": "none",
-            "sample_interval_ms": 500,
-            "heartbeat_interval_ms": 3000,
-            "protection_cooldown_ms": 5000
-          },
-          "scenes": {
-            "gun_limit_challenge": {
-              "name": "枪限挑战",
-              "description": "大量敌人同时生成与销毁的高压力场景",
-              "enabled": true,
-              "detection": {
-                "entity_rate_threshold": 20,
-                "spike_window_ms": 3000,
-                "consecutive_spikes": 3
-              },
-              "protection": {
-                "cpu_throttle": 0.7,
-                "gpu_throttle": 0.6,
-                "frame_limit": 30,
-                "duration_ms": 8000,
-                "fade_out_ms": 3000
-              },
-              "risk_mitigation": {
-                "max_daily_triggers": 50,
-                "cooldown_after_max": 3600000,
-                "gradual_escalation": true
-              }
-            },
-            "thousand_star_domain": {
-              "name": "千星奇域",
-              "description": "大量特效和实体的高渲染压力场景",
-              "enabled": true,
-              "detection": {
-                "entity_rate_threshold": 15,
-                "spike_window_ms": 2000,
-                "consecutive_spikes": 2
-              },
-              "protection": {
-                "cpu_throttle": 0.75,
-                "gpu_throttle": 0.65,
-                "frame_limit": 45,
-                "duration_ms": 6000,
-                "fade_out_ms": 2000
-              },
-              "risk_mitigation": {
-                "max_daily_triggers": 80,
-                "cooldown_after_max": 1800000,
-                "gradual_escalation": true
-              }
-            },
-            "new_nation_dungeon": {
-              "name": "新国家副本",
-              "description": "新区域副本中大规模战斗场景",
-              "enabled": true,
-              "detection": {
-                "entity_rate_threshold": 25,
-                "spike_window_ms": 4000,
-                "consecutive_spikes": 4
-              },
-              "protection": {
-                "cpu_throttle": 0.65,
-                "gpu_throttle": 0.55,
-                "frame_limit": 30,
-                "duration_ms": 10000,
-                "fade_out_ms": 4000
-              },
-              "risk_mitigation": {
-                "max_daily_triggers": 30,
-                "cooldown_after_max": 7200000,
-                "gradual_escalation": true
-              }
-            }
-          },
-          "gpu_monitor": {
-            "spike_threshold_percent": 85,
-            "baseline_window_ms": 10000,
-            "spike_cooldown_ms": 2000
-          },
-          "frame_monitor": {
-            "drop_threshold_percent": 40,
-            "min_fps": 15,
-            "drop_window_ms": 1000
-          },
-          "risk_mitigation": {
-            "account_safety_level": "normal",
-            "max_protections_per_hour": 20,
-            "min_interval_between_protections_ms": 2000,
-            "warning_threshold_count": 10,
-            "auto_slow_down_after_warnings": true
-          },
-          "logging": {
-            "level": "INFO",
-            "max_log_size_mb": 50,
-            "log_to_file": true,
-            "include_metrics": true
-          }
+    // 默认配置 - 从 assets 读取
+    private val defaultConfig by lazy {
+        try {
+            context.assets.open("config/rules.json").bufferedReader().use { it.readText() }
+        } catch (e: Exception) {
+            "{}"
         }
-    """.trimIndent()
+    }
 
     /**
      * 加载配置
@@ -144,7 +49,7 @@ class ConfigManager(private val context: Context) {
                 val content = configFile.readText()
                 config = JSONObject(content)
             } else {
-                // 首次运行，使用默认配置
+                // 首次运行，从 assets 复制默认配置
                 config = JSONObject(defaultConfig)
                 saveConfig()
             }
@@ -173,6 +78,33 @@ class ConfigManager(private val context: Context) {
     fun resetToDefault() {
         config = JSONObject(defaultConfig)
         saveConfig()
+    }
+
+    /**
+     * 导入配置
+     */
+    fun importConfig(jsonString: String): Boolean {
+        return try {
+            val newConfig = JSONObject(jsonString)
+            // 简单校验
+            if (newConfig.has("version") && newConfig.has("scenes")) {
+                config = newConfig
+                saveConfig()
+                true
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Failed to import config", e)
+            false
+        }
+    }
+
+    /**
+     * 导出配置
+     */
+    fun exportConfig(): String {
+        return config.toString(2)
     }
 
     /**
@@ -230,7 +162,18 @@ class ConfigManager(private val context: Context) {
         return try {
             config.getJSONObject("general").getLong("sample_interval_ms")
         } catch (e: Exception) {
-            500L
+            200L
+        }
+    }
+
+    /**
+     * 获取保护窗口时长
+     */
+    fun getProtectionWindowMs(): Long {
+        return try {
+            config.getJSONObject("general").getLong("protection_window_ms")
+        } catch (e: Exception) {
+            1500L
         }
     }
 
@@ -256,7 +199,7 @@ class ConfigManager(private val context: Context) {
             while (keys.hasNext()) {
                 val key = keys.next()
                 val scene = scenes.getJSONObject(key)
-                if (scene.getBoolean("enabled")) {
+                if (scene.optBoolean("enabled", true)) {
                     result[key] = scene
                 }
             }
@@ -264,6 +207,28 @@ class ConfigManager(private val context: Context) {
             android.util.Log.e(TAG, "Failed to get enabled scenes", e)
         }
         return result
+    }
+
+    /**
+     * 获取场景分类配置
+     */
+    fun getSceneCategories(): JSONObject {
+        return try {
+            config.getJSONObject("scene_categories")
+        } catch (e: Exception) {
+            JSONObject()
+        }
+    }
+
+    /**
+     * 获取战斗结算检测配置
+     */
+    fun getSettlementConfig(): JSONObject {
+        return try {
+            config.getJSONObject("battle_settlement_detection")
+        } catch (e: Exception) {
+            JSONObject()
+        }
     }
 
     /**
@@ -300,9 +265,36 @@ class ConfigManager(private val context: Context) {
     }
 
     /**
+     * 获取原神启动静默时长
+     */
+    fun getGenshinSilenceMs(): Long {
+        return try {
+            config.getJSONObject("risk_mitigation").getLong("genshin_start_silence_ms")
+        } catch (e: Exception) {
+            10000L
+        }
+    }
+
+    /**
+     * 获取日志配置
+     */
+    fun getLoggingConfig(): JSONObject {
+        return try {
+            config.getJSONObject("logging")
+        } catch (e: Exception) {
+            JSONObject()
+        }
+    }
+
+    /**
      * 获取原始配置 JSON
      */
     fun getRawConfig(): JSONObject = config
+
+    /**
+     * 获取配置文件路径
+     */
+    fun getConfigFilePath(): String = getConfigFile().absolutePath
 
     private fun getConfigFile(): File {
         return File(context.filesDir, "config/rules.json")

@@ -1,10 +1,14 @@
 package com.spikeguard.ui
 
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.Button
 import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.spikeguard.R
@@ -14,6 +18,7 @@ import com.spikeguard.core.MessageBus
 import com.spikeguard.core.PermissionMode
 import com.spikeguard.core.RunMode
 import com.spikeguard.service.GuardService
+import com.spikeguard.util.LogManager
 
 /**
  * 主界面 Activity
@@ -47,8 +52,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchMode: Switch
     private lateinit var switchPermission: Switch
     private lateinit var switchAutoStart: Switch
+    private lateinit var switchFloatingWindow: Switch
+    private lateinit var btnExportConfig: Button
+    private lateinit var btnImportConfig: Button
+    private lateinit var btnExportLog: Button
+    private lateinit var btnClearLog: Button
 
     private var serviceRunning = false
+
+    companion object {
+        private const val REQUEST_CODE_IMPORT_CONFIG = 1001
+        private const val REQUEST_CODE_OVERLAY = 1002
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -110,6 +125,11 @@ class MainActivity : AppCompatActivity() {
         switchMode = findViewById(R.id.switchMode)
         switchPermission = findViewById(R.id.switchPermission)
         switchAutoStart = findViewById(R.id.switchAutoStart)
+        switchFloatingWindow = findViewById(R.id.switchFloatingWindow)
+        btnExportConfig = findViewById(R.id.btnExportConfig)
+        btnImportConfig = findViewById(R.id.btnImportConfig)
+        btnExportLog = findViewById(R.id.btnExportLog)
+        btnClearLog = findViewById(R.id.btnClearLog)
 
         btnStart.setOnClickListener {
             startGuardService()
@@ -149,6 +169,30 @@ class MainActivity : AppCompatActivity() {
         switchAutoStart.setOnCheckedChangeListener { _, isChecked ->
             val prefs = getSharedPreferences("spikeguard_prefs", MODE_PRIVATE)
             prefs.edit().putBoolean("auto_start", isChecked).apply()
+        }
+
+        switchFloatingWindow.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked) {
+                checkAndShowFloatingWindow()
+            } else {
+                stopFloatingWindow()
+            }
+        }
+
+        btnExportConfig.setOnClickListener {
+            exportConfig()
+        }
+
+        btnImportConfig.setOnClickListener {
+            importConfig()
+        }
+
+        btnExportLog.setOnClickListener {
+            exportLog()
+        }
+
+        btnClearLog.setOnClickListener {
+            clearLogs()
         }
     }
 
@@ -259,6 +303,192 @@ class MainActivity : AppCompatActivity() {
                 else -> getColor(R.color.danger)
             }
         )
+    }
+
+    /**
+     * 导出配置
+     */
+    private fun exportConfig() {
+        try {
+            val configJson = configManager.exportConfig()
+            val fileName = "spikeguard_rules_${System.currentTimeMillis()}.json"
+
+            // 保存到外部存储
+            val exportDir = getExternalFilesDir(null)
+            val exportFile = java.io.File(exportDir, fileName)
+            exportFile.writeText(configJson)
+
+            // 分享文件
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                exportFile
+            )
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "application/json"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, "导出配置"))
+
+            Toast.makeText(this, "配置已导出: $fileName", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * 导入配置
+     */
+    private fun importConfig() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+        }
+        try {
+            startActivityForResult(intent, REQUEST_CODE_IMPORT_CONFIG)
+        } catch (e: Exception) {
+            Toast.makeText(this, "无法打开文件选择器", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * 导出日志
+     */
+    private fun exportLog() {
+        try {
+            val logManager = LogManager.getInstance(this)
+            val logFiles = logManager.getLogFiles()
+
+            if (logFiles.isEmpty()) {
+                Toast.makeText(this, "没有日志文件", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            // 导出最新的日志文件
+            val latestLog = logFiles.maxByOrNull { it.lastModified() }
+            if (latestLog != null) {
+                val exportDir = getExternalFilesDir(null)
+                val exportFile = java.io.File(exportDir, latestLog.name)
+                latestLog.copyTo(exportFile, overwrite = true)
+
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    this,
+                    "$packageName.fileprovider",
+                    exportFile
+                )
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                startActivity(Intent.createChooser(intent, "导出日志"))
+
+                Toast.makeText(this, "日志已导出: ${latestLog.name}", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * 清空日志
+     */
+    private fun clearLogs() {
+        try {
+            val logManager = LogManager.getInstance(this)
+            logManager.clearLogs()
+            Toast.makeText(this, "日志已清空", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "清空失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * 检查并显示悬浮窗
+     */
+    private fun checkAndShowFloatingWindow() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (!Settings.canDrawOverlays(this)) {
+                // 请求悬浮窗权限
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+                startActivityForResult(intent, REQUEST_CODE_OVERLAY)
+                switchFloatingWindow.isChecked = false
+                return
+            }
+        }
+        startFloatingWindow()
+    }
+
+    /**
+     * 启动悬浮窗服务
+     */
+    private fun startFloatingWindow() {
+        val intent = Intent(this, FloatingWindowService::class.java)
+        startService(intent)
+        Toast.makeText(this, "悬浮窗已开启", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * 停止悬浮窗服务
+     */
+    private fun stopFloatingWindow() {
+        val intent = Intent(this, FloatingWindowService::class.java)
+        stopService(intent)
+        Toast.makeText(this, "悬浮窗已关闭", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        when (requestCode) {
+            REQUEST_CODE_IMPORT_CONFIG -> {
+                if (resultCode == RESULT_OK && data != null) {
+                    data.data?.let { uri ->
+                        importConfigFromUri(uri)
+                    }
+                }
+            }
+            REQUEST_CODE_OVERLAY -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    if (Settings.canDrawOverlays(this)) {
+                        switchFloatingWindow.isChecked = true
+                        startFloatingWindow()
+                    } else {
+                        Toast.makeText(this, "悬浮窗权限被拒绝", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 从Uri导入配置
+     */
+    private fun importConfigFromUri(uri: Uri) {
+        try {
+            val inputStream = contentResolver.openInputStream(uri)
+            val jsonString = inputStream?.bufferedReader()?.use { it.readText() } ?: ""
+            inputStream?.close()
+
+            if (configManager.importConfig(jsonString)) {
+                Toast.makeText(this, "配置导入成功", Toast.LENGTH_SHORT).show()
+                // 如果服务正在运行，重启以应用新配置
+                if (serviceRunning) {
+                    val intent = Intent(this, GuardService::class.java).apply {
+                        action = GuardService.ACTION_RESTART
+                    }
+                    startService(intent)
+                }
+            } else {
+                Toast.makeText(this, "配置格式无效", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "导入失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
     }
 
     override fun onResume() {

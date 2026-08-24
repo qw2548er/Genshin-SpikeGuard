@@ -10,6 +10,8 @@ enum class ActionType {
     THERMAL_LIMIT,      // 温控调节
     CLEAR_CACHE,        // 清理缓存
     KILL_BACKGROUND,    // 杀后台进程
+    RECLAIM_MEMORY,     // 回收空闲内存
+    BOOST_PRIORITY,     // 提升进程优先级
 }
 
 /**
@@ -58,6 +60,18 @@ interface ActionExecutor {
      * 设置帧率限制
      */
     fun setFrameLimit(fpsLimit: Int): ActionResult
+
+    /**
+     * 回收空闲内存
+     * 清理后台进程缓存，释放内存给前台应用
+     */
+    fun reclaimMemory(): ActionResult
+
+    /**
+     * 提升目标进程优先级
+     * @param packageName 目标包名
+     */
+    fun boostProcessPriority(packageName: String): ActionResult
 
     /**
      * 恢复默认设置

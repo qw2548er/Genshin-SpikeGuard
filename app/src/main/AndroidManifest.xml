@@ -7,12 +7,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
-    <!-- Shizuku 权限 -->
-    <permission
-        android:name="moe.shizuku.manager.permission.API_V23"
-        android:protectionLevel="dangerous" />
-    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <!-- Shizuku 权限由依赖库自动合并，无需手动声明 -->
 
     <application
         android:allowBackup="true"
@@ -33,6 +31,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 悬浮窗服务 -->
+        <service
+            android:name=".ui.FloatingWindowService"
+            android:enabled="true"
+            android:exported="false" />
 
         <!-- 前台守护服务 - 独立进程，防止随游戏崩溃 -->
         <service
@@ -55,6 +59,17 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!-- FileProvider 用于分享配置和日志文件 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 

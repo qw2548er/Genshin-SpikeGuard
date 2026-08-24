@@ -2,34 +2,79 @@
 
 > 安卓独立 GPU 尖峰防护工具 — 专为原神大批量实体销毁瞬间闪退问题设计
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](https://github.com/your-username/Genshin-SpikeGuard)
+[![CI Build](https://github.com/your-username/Genshin-SpikeGuard/actions/workflows/build.yml/badge.svg)](https://github.com/your-username/Genshin-SpikeGuard/actions)
+
 ## ⚠️ 重要声明
 
 - **本工具仅压制瞬时 GPU 尖峰，不能修复 GPU 底层驱动问题**
 - 极端高压场景下仍可能小概率闪退
 - **Root/Shizuku 操作本身存在一定风险，请谨慎使用**
 - 本工具不会修改游戏 APK，不进行任何进程注入、ptrace 调试或 HOOK
-- 工具纯本地运行，无任何网络请求
+- 工具纯本地运行，无任何网络请求、无广告、无埋点
+- 启动阶段 85% 着色器编译崩溃不在处理范围
 
 ## 项目简介
 
 Genshin SpikeGuard 是一款运行在安卓设备上的独立防护工具，针对 **荣耀 X60（PowerVR GPU）** 等设备在原神中遇到的「大批量实体销毁瞬间运行时闪退」问题。
 
-通过实时监控 GPU 负载、帧率变化和实体数量估算，在识别到高风险场景时，通过系统级频率调控（CPU/GPU 降频 + 帧率限制）压制瞬时尖峰，降低闪退概率。
+通过实时监控 GPU 负载、帧率变化和实体数量估算，在识别到战斗结算前兆（实体骤降 + GPU 尖峰 + 帧率反弹）时，触发 **1500ms 完整保护窗口**：回收空闲内存 → 短时钳制 GPU 峰值 → 提升进程优先级 → 1500ms 后无条件恢复系统原始状态。
 
 ## 功能特性
 
 ### 核心功能
-- 🎯 **场景识别** — 自动识别枪限挑战、千星奇域、新国家副本等高风险场景
+- 🎯 **三级场景分类** — 跳过保护 / 温和监控 / 全套防护，精准匹配风险等级
+- ⚔️ **战斗结算前兆检测** — 识别实体骤降 + GPU 尖峰 + 帧率反弹的组合特征
+- ⏱️ **1500ms 固定保护窗口** — 内存回收 → GPU 钳制 → 优先级提升 → 无条件恢复
 - 📊 **实时监控** — GPU/CPU 负载、帧率、温度、实体数量估算
-- ⚡ **智能保护** — 渐进式降频 + 渐变恢复，减少体感影响
-- 🛡️ **风险缓释** — 多级频率限制、每日/每小时保护次数上限
-- 📝 **双运行模式** — `full_protect` 完整保护 / `log_only` 仅日志模式
+- 🛡️ **风险缓释** — 每小时保护次数上限、最小间隔限制
+- 📝 **双运行模式** — `full_protect` 完整防护 / `log_only` 纯日志零干预
+- 🤫 **原神启动静默期** — 检测到原神启动后自动进入 10 秒静默，避开反作弊初始化扫描
+
+### UI 功能
+- 🎛️ **总开关** — 一键启动/停止保护服务
+- 📤 **配置导入导出** — 一键分享/导入 rules.json 配置
+- 📋 **日志导出** — 导出运行日志用于调试分析
+- 🎈 **悬浮窗** — 小悬浮球显示当前模式、GPU 尖峰次数、防护触发次数
+  - 可拖拽移动，自动吸附屏幕边缘
+  - 点击最小化/展开
+  - 透明度可调
 
 ### 架构设计
 - 🏗️ **解势化架构** — 采集、决策、执行、UI 模块完全隔离，通过消息队列通信
-- 🔄 **独立进程** — 守护服务运行在独立进程，游戏崩溃不影响工具
+- 🔄 **独立进程** — 守护服务运行在独立进程 `:guard`，游戏崩溃不影响工具
 - 🔧 **配置外置** — 所有场景阈值、保护参数全部外置在 `config/rules.json`
 - 🔌 **双权限模式** — 支持 Root 模式和 Shizuku 模式
+
+## 场景划分
+
+| 级别 | 场景 | 处理方式 |
+|------|------|----------|
+| **跳过强保护** | 蒙德、璃月、稻妻、须弥（含全部地下子副本） | 仅日志，不干预 |
+| **温和监控** | 枫丹、纳塔、挪德卡莱、至冬 普通大世界 | 仅日志，不干预 |
+| **全套尖峰防护** | 各国秘境副本、枪限挑战、千星奇域、新国家副本 | 触发 1500ms 完整保护窗口 |
+
+## 保护流程
+
+```
+战斗结算前兆检测
+       ↓
+  回收空闲内存 (drop_caches + compact_memory + kill background)
+       ↓
+  短时钳制 GPU 峰值
+       ↓
+  提升进程优先级 (oom_score_adj + renice)
+       ↓
+  1500ms 后无条件恢复系统原始状态
+```
+
+## 账号风险缓释
+
+1. **原神启动静默期** — 检测到原神启动后 10 秒内停止一切采集和控制，避开反作弊初始化扫描
+2. **双运行模式** — UI 一键切换 `full_protect` / `log_only`
+3. **只读 /proc** — 只读取系统公开信息，不读取游戏内部内存
+4. **独立进程** — 工具运行在自己的独立进程，不侵入游戏进程
 
 ## 依赖要求
 
@@ -42,8 +87,9 @@ Genshin SpikeGuard 是一款运行在安卓设备上的独立防护工具，针�
 ## 使用教程
 
 ### 1. 安装
-- 从 [Releases](https://github.com/your-username/Genshin-SpikeGuard/releases) 下载最新 APK
+- 从 GitHub Actions Artifacts 下载最新 Debug APK
 - 安装到设备
+- 授予悬浮窗权限（如需使用悬浮窗功能）
 
 ### 2. 配置权限
 #### Root 模式
@@ -63,26 +109,38 @@ Genshin SpikeGuard 是一款运行在安卓设备上的独立防护工具，针�
 2. 点击「启动保护」
 3. 前台服务会持续运行并监控性能状态
 
-### 4. 自定义配置
-所有场景和阈值配置都在 `config/rules.json` 中，可以根据需要调整：
+### 4. 配置管理
+- **导出配置**：点击「导出配置」分享当前 rules.json
+- **导入配置**：点击「导入配置」选择 JSON 文件导入
+- **导出日志**：点击「导出日志」分享运行日志
+- **清空日志**：点击「清空日志」清除所有日志文件
 
-```json
-{
-  "scenes": {
-    "gun_limit_challenge": {
-      "name": "枪限挑战",
-      "detection": {
-        "entity_rate_threshold": 20,
-        "consecutive_spikes": 3
-      },
-      "protection": {
-        "gpu_throttle": 0.6,
-        "duration_ms": 8000
-      }
-    }
-  }
-}
-```
+### 5. 悬浮窗
+1. 在设置中开启「悬浮窗显示」
+2. 首次使用需授予悬浮窗权限
+3. 小悬浮球显示当前模式、GPU 尖峰次数、防护触发次数
+4. 拖拽移动位置，自动吸附屏幕边缘
+5. 点击悬浮球可最小化/展开
+
+## CI 说明
+
+本项目使用 GitHub Actions 自动构建 APK：
+
+- 每次提交到主分支触发构建
+- 仅构建 Debug APK，输出到 Artifacts
+- v0.x.x 为开发测试版，不发布 Release
+- 核心功能验证通过后再配置 Release 签名和自动发版
+
+构建状态可在 [Actions](https://github.com/your-username/Genshin-SpikeGuard/actions) 页面查看。
+
+## 版本管理
+
+| 版本 | 说明 |
+|------|------|
+| v0.x.x | 开发测试版，CI 仅构建 Debug APK |
+| v1.0.0+ | 正式版，配置 Release 签名和自动发版 |
+
+当前版本：**v0.1.0**
 
 ## 架构说明
 
@@ -113,9 +171,9 @@ Genshin SpikeGuard 是一款运行在安卓设备上的独立防护工具，针�
 | 模块 | 职责 |
 |------|------|
 | **采集模块 (Collector)** | 采集 GPU/CPU 负载、帧率、温度等性能数据 |
-| **决策模块 (Decision)** | 场景识别、风险评估、保护决策 |
-| **执行模块 (Executor)** | 执行频率调控、帧率限制等保护动作 |
-| **UI 模块 (UI)** | 用户界面、状态展示、设置管理 |
+| **决策模块 (Decision)** | 场景识别、战斗结算检测、风险评估、保护决策 |
+| **执行模块 (Executor)** | 内存回收、GPU/CPU 频率调控、进程优先级提升 |
+| **UI 模块 (UI)** | 用户界面、状态展示、设置管理、悬浮窗 |
 
 ### 进程隔离
 
@@ -130,12 +188,14 @@ Genshin SpikeGuard 是一款运行在安卓设备上的独立防护工具，针�
 2. **极端场景仍可能闪退** — 极高压力下保护效果有限
 3. **估算存在误差** — 实体数量通过性能数据反推，可能存在偏差
 4. **设备兼容性** — 主要针对荣耀 X60 / PowerVR GPU 优化，其他设备可能需要调整
+5. **着色器编译崩溃** — 启动阶段 85% 着色器编译崩溃不在处理范围
 
 ### 账号风险
 - 工具不修改游戏数据、不注入游戏进程
 - 不绕过任何反作弊机制
 - 系统级频率调控是安卓系统正常功能
 - **Root 本身是风险因素，工具不会额外增加风控特征**
+- 原神启动时有 10 秒静默期，避开反作弊初始化扫描
 
 ### 使用建议
 1. 先用「仅日志模式」运行一段时间，观察数据
@@ -150,7 +210,7 @@ Genshin SpikeGuard 是一款运行在安卓设备上的独立防护工具，针�
 # Debug 构建
 ./gradlew assembleDebug
 
-# Release 构建
+# Release 构建（需要签名配置）
 ./gradlew assembleRelease
 ```
 
@@ -162,9 +222,26 @@ app/src/main/java/com/spikeguard/
 ├── decision/       # 决策模块
 ├── executor/       # 执行模块
 ├── service/        # 前台服务
-├── ui/             # UI 界面
-└── util/           # 工具类
+├── ui/             # UI 界面 + 悬浮窗
+└── util/           # 工具类（日志管理、开机自启）
+
+app/src/main/assets/
+└── config/
+    └── rules.json  # 所有场景和阈值配置
 ```
+
+### 配置说明
+
+所有场景和阈值配置都在 `config/rules.json` 中，主要配置项：
+
+| 配置项 | 说明 |
+|--------|------|
+| `scene_categories` | 三级场景分类定义 |
+| `scenes` | 各场景的检测和保护参数 |
+| `battle_settlement_detection` | 战斗结算前兆检测参数 |
+| `gpu_monitor` | GPU 监控和尖峰检测参数 |
+| `frame_monitor` | 帧率监控参数 |
+| `risk_mitigation` | 风险缓释参数（静默时长、保护次数限制等） |
 
 ### 添加新场景
 在 `config/rules.json` 的 `scenes` 中添加新的场景配置：
@@ -172,19 +249,26 @@ app/src/main/java/com/spikeguard/
 ```json
 "new_scene": {
   "name": "新场景名称",
+  "category": "full_protection",
   "description": "场景描述",
   "enabled": true,
   "detection": {
     "entity_rate_threshold": 20,
-    "spike_window_ms": 3000,
-    "consecutive_spikes": 3
+    "spike_window_ms": 2000,
+    "consecutive_spikes": 2,
+    "battle_settlement_pattern": true
   },
   "protection": {
-    "cpu_throttle": 0.7,
-    "gpu_throttle": 0.6,
-    "frame_limit": 30,
-    "duration_ms": 8000,
-    "fade_out_ms": 3000
+    "reclaim_memory": true,
+    "gpu_throttle": 0.5,
+    "cpu_throttle": 0.6,
+    "boost_priority": true,
+    "duration_ms": 1500,
+    "unconditional_restore": true
+  },
+  "risk_mitigation": {
+    "max_daily_triggers": 100,
+    "min_interval_ms": 2000
   }
 }
 ```
@@ -192,16 +276,19 @@ app/src/main/java/com/spikeguard/
 ## 常见问题
 
 ### Q: 为什么需要 Root/Shizuku？
-A: 频率调控需要修改系统级别的 sysfs 参数，普通应用权限不足。
+A: 频率调控和内存回收需要修改系统级别的 sysfs 参数，普通应用权限不足。
 
 ### Q: 会被封号吗？
-A: 工具不修改游戏数据、不注入进程、不绕过反作弊。但 Root 本身是风险因素，请自行评估。
+A: 工具不修改游戏数据、不注入进程、不绕过反作弊。原神启动时有 10 秒静默期避开反作弊扫描。但 Root 本身是风险因素，请自行评估。
 
 ### Q: 支持哪些设备？
 A: 主要针对荣耀 X60 / PowerVR GPU 优化，其他设备可能需要调整 sysfs 路径和配置参数。
 
 ### Q: 为什么不直接修改游戏？
 A: 修改游戏 APK 或注入进程属于破解行为，有封号风险，且违反用户协议。本工具走的是系统级调控的合规路线。
+
+### Q: 为什么启动阶段的崩溃不处理？
+A: 启动阶段 85% 的崩溃是由于着色器编译导致的，与运行时 GPU 尖峰无关，不在本工具处理范围内。
 
 ## License
 

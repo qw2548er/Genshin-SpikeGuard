@@ -38,6 +38,15 @@ class GuardService : Service() {
     private var heartbeatHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var heartbeatCount = 0L
 
+    // 原神进程监控 - 用于启动静默期
+    private var genshinMonitorHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var genshinWasRunning = false
+    private val genshinPackages = listOf(
+        "com.miHoYo.GenshinImpact",
+        "com.miHoYo.Yuanshen",
+        "com.mihoyo.genshinimpact"
+    )
+
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
             heartbeatCount++
@@ -47,6 +56,26 @@ class GuardService : Service() {
                 "uptime_ms" to (System.currentTimeMillis() - startTime)
             )
             heartbeatHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * 原神进程监控Runnable
+     * 检测原神启动时进入静默模式，避开反作弊初始化扫描
+     */
+    private val genshinMonitorRunnable = object : Runnable {
+        override fun run() {
+            val isRunning = isGenshinRunning()
+
+            if (isRunning && !genshinWasRunning) {
+                // 原神刚启动，进入静默模式
+                val silenceMs = configManager.getGenshinSilenceMs()
+                Log.i(TAG, "Genshin detected! Entering silent mode for ${silenceMs}ms")
+                decisionEngine.enterSilentMode(silenceMs)
+            }
+
+            genshinWasRunning = isRunning
+            genshinMonitorHandler.postDelayed(this, GENSHIN_MONITOR_INTERVAL_MS)
         }
     }
 
@@ -77,7 +106,9 @@ class GuardService : Service() {
         // 初始化决策引擎
         val scenes = configManager.getEnabledScenes()
         val riskConfig = configManager.getRiskMitigationConfig()
-        decisionEngine = DecisionEngine(scenes, riskConfig)
+        val settlementConfig = configManager.getSettlementConfig()
+        val sceneCategories = configManager.getSceneCategories()
+        decisionEngine = DecisionEngine(scenes, riskConfig, settlementConfig, sceneCategories)
 
         // 初始化执行管理器
         executionManager = ExecutionManager(this, configManager)
@@ -87,6 +118,9 @@ class GuardService : Service() {
 
         // 启动心跳
         heartbeatHandler.post(heartbeatRunnable)
+
+        // 启动原神进程监控
+        genshinMonitorHandler.post(genshinMonitorRunnable)
 
         // 发布服务启动事件
         bus.publish(
@@ -125,6 +159,9 @@ class GuardService : Service() {
 
         // 停止心跳
         heartbeatHandler.removeCallbacksAndMessages(null)
+
+        // 停止原神进程监控
+        genshinMonitorHandler.removeCallbacksAndMessages(null)
 
         // 停止所有模块
         stopModules()
@@ -237,11 +274,31 @@ class GuardService : Service() {
         notificationManager.notify(NOTIFICATION_ID, createNotification(text))
     }
 
+    /**
+     * 检测原神是否在运行
+     */
+    private fun isGenshinRunning(): Boolean {
+        for (pkg in genshinPackages) {
+            try {
+                val process = Runtime.getRuntime().exec("pidof $pkg")
+                val output = process.inputStream.bufferedReader().readText().trim()
+                process.waitFor()
+                if (output.isNotEmpty()) {
+                    return true
+                }
+            } catch (e: Exception) {
+                // 继续尝试下一个
+            }
+        }
+        return false
+    }
+
     companion object {
         private const val TAG = "GuardService"
         private const val CHANNEL_ID = "spikeguard_guard"
         private const val NOTIFICATION_ID = 1001
         private const val HEARTBEAT_INTERVAL_MS = 3000L
+        private const val GENSHIN_MONITOR_INTERVAL_MS = 2000L
 
         const val ACTION_START = "com.spikeguard.action.START"
         const val ACTION_STOP = "com.spikeguard.action.STOP"

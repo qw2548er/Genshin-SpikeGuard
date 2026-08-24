@@ -124,6 +124,13 @@ class ExecutionManager(
 
     /**
      * 保护触发处理
+     *
+     * 完整保护流程：
+     * 1. 回收空闲内存
+     * 2. GPU钳制
+     * 3. CPU钳制
+     * 4. 提升进程优先级
+     * 5. 帧率限制（可选）
      */
     private fun onProtectionTriggered(event: com.spikeguard.core.GuardEvent) {
         val executor = currentExecutor ?: return
@@ -134,17 +141,58 @@ class ExecutionManager(
         val gpuThrottle = event.data["gpu_throttle"] as? Float ?: 0.6f
         val frameLimit = event.data["frame_limit"] as? Int ?: 30
         val durationMs = event.data["duration_ms"] as? Long ?: 8000
+        val reclaimMemory = event.data["reclaim_memory"] as? Boolean ?: true
+        val boostPriority = event.data["boost_priority"] as? Boolean ?: true
+        val logOnly = event.data["log_only"] as? Boolean ?: false
 
         android.util.Log.i(TAG,
             "Executing protection: scene=$sceneName, " +
-                    "cpu=${(cpuThrottle * 100).toInt()}%, " +
+                    "reclaim_mem=$reclaimMemory, " +
                     "gpu=${(gpuThrottle * 100).toInt()}%, " +
-                    "fps=$frameLimit, " +
-                    "duration=${durationMs}ms")
+                    "cpu=${(cpuThrottle * 100).toInt()}%, " +
+                    "boost_priority=$boostPriority, " +
+                    "duration=${durationMs}ms, " +
+                    "log_only=$logOnly")
 
-        // 执行保护动作
-        val cpuResult = executor.setCpuThrottle(cpuThrottle)
+        if (logOnly) {
+            // 纯日志模式，不执行实际动作
+            android.util.Log.i(TAG, "[LOG ONLY] Protection would be triggered for $sceneName")
+            bus.publish(
+                EventType.ACTION_EXECUTED,
+                "scene_id" to sceneId,
+                "scene_name" to sceneName,
+                "log_only" to true,
+                "executor" to executor.name
+            )
+            return
+        }
+
+        // 步骤1: 回收内存
+        val memoryResult = if (reclaimMemory) {
+            executor.reclaimMemory()
+        } else {
+            ActionResult(ActionType.RECLAIM_MEMORY, true, "Skipped")
+        }
+
+        // 步骤2: GPU钳制
         val gpuResult = executor.setGpuThrottle(gpuThrottle)
+
+        // 步骤3: CPU钳制
+        val cpuResult = executor.setCpuThrottle(cpuThrottle)
+
+        // 步骤4: 提升进程优先级（针对原神）
+        val priorityResult = if (boostPriority) {
+            val genshinPackage = detectGenshinPackage()
+            if (genshinPackage != null) {
+                executor.boostProcessPriority(genshinPackage)
+            } else {
+                ActionResult(ActionType.BOOST_PRIORITY, false, "Genshin process not found")
+            }
+        } else {
+            ActionResult(ActionType.BOOST_PRIORITY, true, "Skipped")
+        }
+
+        // 步骤5: 帧率限制（可选）
         val frameResult = executor.setFrameLimit(frameLimit)
 
         currentCpuThrottle = cpuThrottle
@@ -157,10 +205,13 @@ class ExecutionManager(
             EventType.ACTION_EXECUTED,
             "scene_id" to sceneId,
             "scene_name" to sceneName,
-            "cpu_result" to cpuResult.success,
+            "memory_result" to memoryResult.success,
             "gpu_result" to gpuResult.success,
+            "cpu_result" to cpuResult.success,
+            "priority_result" to priorityResult.success,
             "frame_result" to frameResult.success,
-            "executor" to executor.name
+            "executor" to executor.name,
+            "log_only" to false
         )
     }
 
@@ -248,6 +299,32 @@ class ExecutionManager(
      * 是否活跃
      */
     fun isActive(): Boolean = isActive
+
+    /**
+     * 检测原神包名
+     * 尝试多个可能的包名，返回第一个找到的
+     */
+    private fun detectGenshinPackage(): String? {
+        val possiblePackages = listOf(
+            "com.miHoYo.GenshinImpact",
+            "com.miHoYo.Yuanshen",
+            "com.mihoyo.genshinimpact"
+        )
+
+        for (pkg in possiblePackages) {
+            try {
+                val process = Runtime.getRuntime().exec("pidof $pkg")
+                val output = process.inputStream.bufferedReader().readText().trim()
+                process.waitFor()
+                if (output.isNotEmpty()) {
+                    return pkg
+                }
+            } catch (e: Exception) {
+                // 继续尝试下一个
+            }
+        }
+        return null
+    }
 
     companion object {
         private const val TAG = "ExecutionManager"

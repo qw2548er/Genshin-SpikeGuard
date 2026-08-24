@@ -140,6 +140,47 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
         }
     }
 
+    override fun reclaimMemory(): ActionResult {
+        return try {
+            var reclaimed = 0
+
+            // 清理缓存
+            execWithShizuku("echo 3 > /proc/sys/vm/drop_caches")
+            reclaimed += 1
+
+            // 压缩内存
+            execWithShizuku("echo 1 > /proc/sys/vm/compact_memory")
+            reclaimed += 1
+
+            // 杀后台
+            execWithShizuku("am kill-all background")
+            reclaimed += 1
+
+            ActionResult(ActionType.RECLAIM_MEMORY, true,
+                "Memory reclaimed ($reclaimed methods applied) via Shizuku")
+        } catch (e: Exception) {
+            ActionResult(ActionType.RECLAIM_MEMORY, false, e.message ?: "Unknown error")
+        }
+    }
+
+    override fun boostProcessPriority(packageName: String): ActionResult {
+        return try {
+            val pid = getPidByPackage(packageName)
+            if (pid > 0) {
+                execWithShizuku("echo -1000 > /proc/$pid/oom_score_adj")
+                execWithShizuku("renice -10 -p $pid")
+
+                ActionResult(ActionType.BOOST_PRIORITY, true,
+                    "Priority boosted for $packageName (pid=$pid) via Shizuku")
+            } else {
+                ActionResult(ActionType.BOOST_PRIORITY, false,
+                    "Process not found: $packageName")
+            }
+        } catch (e: Exception) {
+            ActionResult(ActionType.BOOST_PRIORITY, false, e.message ?: "Unknown error")
+        }
+    }
+
     override fun resetAll(): ActionResult {
         return try {
             // 恢复所有原始值
@@ -225,6 +266,18 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
             true
         } catch (e: Exception) {
             false
+        }
+    }
+
+    /**
+     * 通过包名获取进程PID
+     */
+    private fun getPidByPackage(packageName: String): Int {
+        return try {
+            val output = execWithShizuku("pidof $packageName").trim()
+            output.split(" ").firstOrNull()?.toIntOrNull() ?: 0
+        } catch (e: Exception) {
+            0
         }
     }
 
