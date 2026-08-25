@@ -88,6 +88,11 @@ class DecisionEngine(
     private val settlementState = SettlementDetectionState()
     private val entityHistory = ArrayDeque<Pair<Long, Int>>()
     private val fpsHistory = ArrayDeque<Pair<Long, Int>>()
+    // Fix-3：基础保底场景识别所需的 GPU/CPU 历史（最近 10 秒，用于判定"大世界稳定"/"战斗中波动"）
+    private val gpuLoadHistory = ArrayDeque<Pair<Long, Float>>()
+    private val cpuLoadHistory = ArrayDeque<Pair<Long, Float>>()
+    private var lastReportedSceneId: String? = null
+    private var lastReportedSceneName: String? = null
 
     // 静默期 - 原神启动时停止一切活动
     private var silentMode = false
@@ -233,24 +238,70 @@ class DecisionEngine(
 
     /**
      * 性能采样处理
+     *
+     * Fix-2：每次采样时独立计算风险等级（不依赖是否触发保护）
+     *   GPU > 80 或 CPU > 90 或 实体 > 50 → 1项=MEDIUM, 2项=HIGH, 3项=CRITICAL
+     * Fix-3：基础保底场景识别（不依赖 scenesConfig 阈值，也不依赖 evaluateProtection 是否命中）
+     *   近10秒稳定低负载 + 帧率稳定 → 大世界
+     *   高负载 或 连续尖峰 或 帧率大幅波动 → 战斗中
      */
     private fun onMetricsSample(event: GuardEvent) {
         if (isSilent()) return
 
         val fps = event.data["fps"] as? Int ?: 60
+        val gpuLoad = (event.data["gpu_load"] as? Float) ?: 0f
+        val cpuLoad = (event.data["cpu_load"] as? Float) ?: 0f
         val entityEstimate = event.data["entity_estimate"] as? Int ?: 0
         val now = System.currentTimeMillis()
 
-        // 记录历史数据
+        // ===== Fix-2：风险等级独立计算 =====
+        val hits = listOf(gpuLoad > 80f, cpuLoad > 90f, entityEstimate > 50).count { it }
+        val newRisk = when (hits) {
+            3 -> RiskLevel.CRITICAL
+            2 -> RiskLevel.HIGH
+            1 -> RiskLevel.MEDIUM
+            else -> RiskLevel.LOW
+        }
+        if (newRisk != currentRiskLevel) {
+            Log.d(TAG, "[Risk] re-evaluate: gpu=$gpuLoad, cpu=$cpuLoad, entity=$entityEstimate " +
+                    "=> hits=$hits => ${currentRiskLevel.name} -> ${newRisk.name}")
+            updateRiskLevel(newRisk)
+        }
+
+        // ===== Fix-3：基础保底场景识别 + 上报（即便没触发保护也上报）=====
+        // 追加历史
+        gpuLoadHistory.addLast(now to gpuLoad)
+        cpuLoadHistory.addLast(now to cpuLoad)
         entityHistory.addLast(now to entityEstimate)
         fpsHistory.addLast(now to fps)
+        while (gpuLoadHistory.isNotEmpty() && now - gpuLoadHistory.first().first > 10_000L) gpuLoadHistory.removeFirst()
+        while (cpuLoadHistory.isNotEmpty() && now - cpuLoadHistory.first().first > 10_000L) cpuLoadHistory.removeFirst()
+        while (entityHistory.isNotEmpty() && now - entityHistory.first().first > 10_000L) entityHistory.removeFirst()
+        while (fpsHistory.isNotEmpty() && now - fpsHistory.first().first > 10_000L) fpsHistory.removeFirst()
 
-        // 清理过期数据（保留5秒）
-        while (entityHistory.isNotEmpty() && now - entityHistory.first().first > 5000) {
-            entityHistory.removeFirst()
+        // 基础判断
+        val avgGpu = if (gpuLoadHistory.size > 0) gpuLoadHistory.map { it.second }.average().toFloat() else 0f
+        val avgCpu = if (cpuLoadHistory.size > 0) cpuLoadHistory.map { it.second }.average().toFloat() else 0f
+        val fpsStdDev = computeStdDev(fpsHistory.map { it.second.toDouble() })
+        val highLoad = avgGpu > 70f || avgCpu > 80f || consecutiveSpikes >= 2 || entityEstimate > 40
+        val fpsUnstable = fpsStdDev > 6.0
+        val (sceneId, sceneName) = when {
+            highLoad || fpsUnstable -> "battle_combat" to "战斗中"
+            avgGpu < 40f && avgCpu < 50f && fps >= 30 && fpsStdDev < 5.0 -> "open_world" to "大世界"
+            else -> "idle_unknown" to "待识别"
         }
-        while (fpsHistory.isNotEmpty() && now - fpsHistory.first().first > 5000) {
-            fpsHistory.removeFirst()
+        // 有变化才下发，避免广播风暴
+        if (sceneId != lastReportedSceneId || sceneName != lastReportedSceneName) {
+            lastReportedSceneId = sceneId
+            lastReportedSceneName = sceneName
+            Log.d(TAG, "[Scene] basic detect: highLoad=$highLoad, fpsUnstable=$fpsUnstable, " +
+                    "avgGpu=$avgGpu, avgCpu=$avgCpu, fpsStdDev=$fpsStdDev => $sceneName")
+            bus.publish(
+                EventType.SCENE_CHANGED,
+                "scene_id" to sceneId,
+                "scene_name" to sceneName,
+                "active" to true
+            )
         }
 
         // 帧率恢复时重置连续尖峰计数
@@ -654,6 +705,20 @@ class DecisionEngine(
     fun getTotalGpuSpikes(): Int = totalGpuSpikes
     fun getTotalProtections(): Int = totalProtections
     fun isSilentMode(): Boolean = isSilent()
+
+    /**
+     * Fix-3：计算标准差，用来判断 FPS 稳定度
+     */
+    private fun computeStdDev(values: List<Double>): Double {
+        if (values.size < 3) return 0.0
+        val mean = values.average()
+        var sumSq = 0.0
+        for (v in values) {
+            val d = v - mean
+            sumSq += d * d
+        }
+        return kotlin.math.sqrt(sumSq / values.size)
+    }
 
     companion object {
         private const val TAG = "DecisionEngine"

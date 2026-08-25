@@ -75,6 +75,11 @@ class UiStateBridge(private val context: Context) {
             broadcastTestProtectionResult(event.data)
         }
 
+        // ===== Fix-4: 转发实际执行方式变更（Shizuku Binder / Root Shell / LogOnly）=====
+        bus.subscribe(EventType.ACTUAL_EXECUTOR_CHANGED) { event ->
+            broadcastActualExecutorChanged(event.data)
+        }
+
         Log.i(TAG, "UiStateBridge started - cross-process broadcast enabled")
     }
 
@@ -252,6 +257,29 @@ class UiStateBridge(private val context: Context) {
         }
     }
 
+    /**
+     * Fix-4: 广播实际执行方式变更
+     * 数据：executor_name, detailed_status, human_message, fallback_reason
+     */
+    private fun broadcastActualExecutorChanged(data: Map<String, Any>) {
+        try {
+            val intent = Intent(ACTION_ACTUAL_EXECUTOR_CHANGED).apply {
+                setPackage(context.packageName)
+                data.forEach { (key, value) ->
+                    when (value) {
+                        is String -> putExtra(key, value)
+                        is Int -> putExtra(key, value)
+                        is Long -> putExtra(key, value)
+                        is Boolean -> putExtra(key, value)
+                    }
+                }
+            }
+            context.sendBroadcast(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to broadcast actual executor changed", e)
+        }
+    }
+
     companion object {
         private const val TAG = "UiStateBridge"
 
@@ -262,5 +290,6 @@ class UiStateBridge(private val context: Context) {
         const val ACTION_MODE_CHANGED = "com.spikeguard.action.MODE_CHANGED"
         const val ACTION_SCENE_EVENT = "com.spikeguard.action.SCENE_EVENT"
         const val ACTION_TEST_PROTECTION_RESULT = "com.spikeguard.action.TEST_PROTECTION_RESULT"
+        const val ACTION_ACTUAL_EXECUTOR_CHANGED = "com.spikeguard.action.ACTUAL_EXECUTOR_CHANGED"
     }
 }

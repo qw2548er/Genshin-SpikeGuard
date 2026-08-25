@@ -65,6 +65,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvScene: TextView
     private lateinit var btnLaunchShizuku: Button
 
+    // Fix-4/Fix-6: 实际执行方式显示 + 重试连接按钮
+    private lateinit var tvActualExecutor: TextView
+    private lateinit var btnReconnectExecutor: Button
+
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
     private lateinit var switchMode: Switch
@@ -156,6 +160,10 @@ class MainActivity : AppCompatActivity() {
         tvScene = findViewById(R.id.tvScene)
         btnLaunchShizuku = findViewById(R.id.btnLaunchShizuku)
 
+        // Fix-4/Fix-6: 实际执行方式显示 + 重试连接按钮
+        tvActualExecutor = findViewById(R.id.tvActualExecutor)
+        btnReconnectExecutor = findViewById(R.id.btnReconnectExecutor)
+
         btnStart = findViewById(R.id.btnStart)
         btnStop = findViewById(R.id.btnStop)
         switchMode = findViewById(R.id.switchMode)
@@ -242,6 +250,11 @@ class MainActivity : AppCompatActivity() {
             onLaunchShizukuClicked()
         }
 
+        // Fix-6: 重试连接按钮 → 重新探测执行器（Shizuku→Root→LogOnly），不用重启APP
+        btnReconnectExecutor.setOnClickListener {
+            onReconnectExecutorClicked()
+        }
+
         // 初始化场景显示
         updateSceneDisplay()
     }
@@ -326,16 +339,73 @@ class MainActivity : AppCompatActivity() {
                         val total = intent.getIntExtra("attempted_count", 0)
                         val ms = intent.getLongExtra("total_ms", 0L)
                         val exec = intent.getStringExtra("executor") ?: "?"
+                        val errReason = intent.getStringExtra("error_reason") ?: "UNKNOWN"
+                        val detailStatus = intent.getStringExtra("detailed_status") ?: ""
                         btnTestProtection.isEnabled = true
                         btnTestProtection.text = "🧪 测试保护（完成：$ok/$total，${ms}ms · $exec）"
-                        if (anySuccess) {
-                            Toast.makeText(this@MainActivity,
-                                "✅ 测试保护执行成功（${ms}ms，${ok}/${total}步完成）",
-                                Toast.LENGTH_SHORT).show()
-                        } else {
-                            Toast.makeText(this@MainActivity,
-                                "❌ 测试保护未生效，请检查Shizuku/Root授权",
-                                Toast.LENGTH_LONG).show()
+                        // Fix-5: 根据具体错误原因给不同提示+引导
+                        when {
+                            anySuccess -> {
+                                Toast.makeText(this@MainActivity,
+                                    "✅ 测试保护执行成功（${ms}ms，${ok}/${total}步完成）",
+                                    Toast.LENGTH_SHORT).show()
+                            }
+                            errReason.startsWith("NO_EXECUTOR") -> {
+                                Toast.makeText(this@MainActivity,
+                                    "❌ 服务未启动：请先点「启动保护」让后台服务运行",
+                                    Toast.LENGTH_LONG).show()
+                                btnReconnectExecutor.visibility = android.view.View.VISIBLE
+                            }
+                            errReason == "PAUSED_SILENT" -> {
+                                Toast.makeText(this@MainActivity,
+                                    "⏸ 静默中：原神还没启动，等原神启动后自动退出静默",
+                                    Toast.LENGTH_LONG).show()
+                            }
+                            errReason.startsWith("LOGONLY_") -> {
+                                Toast.makeText(this@MainActivity,
+                                    "📝 当前为纯日志模式（无Shizuku/Root权限）\n→ 点击「启动Shizuku/授权应用」获得真正保护能力",
+                                    Toast.LENGTH_LONG).show()
+                                btnLaunchShizuku.visibility = android.view.View.VISIBLE
+                                btnReconnectExecutor.visibility = android.view.View.VISIBLE
+                            }
+                            errReason.startsWith("SHIZUKU_") -> {
+                                val shizukuHint = when {
+                                    errReason.contains("NOT_INSTALLED") -> "Shizuku未安装：请从 shizuku.rikka.app 下载安装"
+                                    errReason.contains("SERVICE_NOT_RUNNING") -> "Shizuku服务未启动：打开Shizuku APP 并点击「启动」"
+                                    errReason.contains("PERMISSION_DENIED") -> "Shizuku未授权：打开Shizuku → 已授权应用 → 打开 SpikeGuard 开关"
+                                    errReason.contains("INITIALIZING") || errReason.contains("HANDSHAKE") -> "Shizuku握手超时：点击下方「重试连接」，或检查 Shizuku 是否真的在运行"
+                                    else -> "Shizuku状态异常($errReason)：请确认Shizuku APP已运行并授权本应用"
+                                }
+                                Toast.makeText(this@MainActivity,
+                                    "❌ Shizuku不可用：\n$shizukuHint",
+                                    Toast.LENGTH_LONG).show()
+                                btnLaunchShizuku.visibility = android.view.View.VISIBLE
+                                btnReconnectExecutor.visibility = android.view.View.VISIBLE
+                            }
+                            errReason.startsWith("ROOT_") -> {
+                                Toast.makeText(this@MainActivity,
+                                    "❌ Root不可用：请确认Magisk/KernelSU已装并授予SpikeGuard Root权限\n（当前检测结果：$detailStatus）",
+                                    Toast.LENGTH_LONG).show()
+                                btnReconnectExecutor.visibility = android.view.View.VISIBLE
+                            }
+                            errReason.startsWith("EXECUTION_ALL_") -> {
+                                Toast.makeText(this@MainActivity,
+                                    "❌ 执行失败：所有步骤返回失败\n可能是授权假阳性 → 请重启Shizuku服务后点「重试连接」",
+                                    Toast.LENGTH_LONG).show()
+                                btnReconnectExecutor.visibility = android.view.View.VISIBLE
+                            }
+                            errReason.startsWith("EXECUTION_EXCEPTION") -> {
+                                Toast.makeText(this@MainActivity,
+                                    "❌ 执行异常：$errReason\n建议点「重试连接」或重启服务",
+                                    Toast.LENGTH_LONG).show()
+                                btnReconnectExecutor.visibility = android.view.View.VISIBLE
+                            }
+                            else -> {
+                                Toast.makeText(this@MainActivity,
+                                    "❌ 测试保护未生效（$errReason），请检查Shizuku/Root授权",
+                                    Toast.LENGTH_LONG).show()
+                                btnReconnectExecutor.visibility = android.view.View.VISIBLE
+                            }
                         }
                         // 10秒后恢复按钮默认文案
                         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
@@ -343,6 +413,14 @@ class MainActivity : AppCompatActivity() {
                                 btnTestProtection.text = "🧪 测试保护（手动触发完整1500ms流程）"
                             }
                         }, 10_000L)
+                    }
+                    // Fix-4: 实际执行方式变更（ExecutionManager自动探测结果）
+                    UiStateBridge.ACTION_ACTUAL_EXECUTOR_CHANGED -> {
+                        val executorName = intent.getStringExtra("executor_name") ?: "unknown"
+                        val detailedStatus = intent.getStringExtra("detailed_status") ?: ""
+                        val humanMessage = intent.getStringExtra("human_message") ?: ""
+                        val fallbackReason = intent.getStringExtra("fallback_reason") ?: ""
+                        updateActualExecutorDisplay(executorName, detailedStatus, humanMessage, fallbackReason)
                     }
                 }
             }
@@ -356,6 +434,7 @@ class MainActivity : AppCompatActivity() {
             addAction(UiStateBridge.ACTION_MODE_CHANGED)
             addAction(UiStateBridge.ACTION_SCENE_EVENT)
             addAction(UiStateBridge.ACTION_TEST_PROTECTION_RESULT)
+            addAction(UiStateBridge.ACTION_ACTUAL_EXECUTOR_CHANGED)
         }
         // Android 13+ 必须指定 exported 标志
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -628,6 +707,117 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Fix-4: 更新实际执行方式显示
+     * 根据自动探测结果：Shizuku Binder / Root Shell / LogOnly
+     * 自动上色 + 降级时显示原因
+     */
+    private fun updateActualExecutorDisplay(
+        executorName: String,
+        detailedStatus: String,
+        humanMessage: String,
+        fallbackReason: String
+    ) {
+        val (displayName, color, isOk) = when {
+            executorName.contains("Shizuku", ignoreCase = true) || detailedStatus == "BINDER_OK" -> {
+                if (detailedStatus == "BINDER_OK") {
+                    Triple("✅ Shizuku Binder (最高优先级)", R.color.good, true)
+                } else {
+                    Triple("⚠ Shizuku 异常: $humanMessage", R.color.warning, false)
+                }
+            }
+            executorName.contains("Root", ignoreCase = true) || executorName.contains("Shell", ignoreCase = true) -> {
+                Triple("🔑 Root Shell (已自动降级，Shizuku不可用)", R.color.warning, true)
+            }
+            executorName.contains("Log", ignoreCase = true) -> {
+                Triple("📝 LogOnly (纯日志，无法执行保护)", R.color.danger, false)
+            }
+            else -> {
+                Triple("执行方式: $executorName", R.color.text_secondary, false)
+            }
+        }
+
+        // 降级时附加原因（小字显示）
+        val reasonText = if (fallbackReason.isNotEmpty() && fallbackReason != "FALLBACK_NONE"
+            && fallbackReason != "SHIZUKU_BINDER_OK" && fallbackReason != "ROOT_OK") {
+            "\n降级原因: $fallbackReason"
+        } else ""
+
+        val hint = if (!isOk && !fallbackReason.contains("LOGONLY") && !fallbackReason.contains("RUNMODE_LOGONLY")) {
+            "\n→ 可点击下方「重试连接」或「启动Shizuku」按钮修复"
+        } else ""
+
+        tvActualExecutor.text = "执行方式: $displayName$reasonText$hint"
+        tvActualExecutor.setTextColor(getColor(color))
+
+        // 探测完成 → 重试按钮状态恢复（无论成功失败，都允许用户再次点击）
+        if (::btnReconnectExecutor.isInitialized) {
+            btnReconnectExecutor.isEnabled = true
+            btnReconnectExecutor.text = "🔄 重试连接（重新检测 Shizuku/Root）"
+        }
+
+        // 非最佳状态 → 显示重试和引导按钮
+        if (!isOk) {
+            btnReconnectExecutor.visibility = android.view.View.VISIBLE
+            if (fallbackReason.contains("SHIZUKU", ignoreCase = true) || executorName.contains("Log", ignoreCase = true)) {
+                btnLaunchShizuku.visibility = android.view.View.VISIBLE
+            }
+        } else {
+            // Shizuku正常 → 重试按钮保留（用户可能想手动刷新），但引导按钮隐藏
+            btnLaunchShizuku.visibility = android.view.View.GONE
+        }
+    }
+
+    /**
+     * Fix-6: 重试连接按钮 → 请求 GuardService 重新探测执行器
+     * 如果服务还没启动，先启动服务再立刻发 RECONNECT 指令
+     */
+    private fun onReconnectExecutorClicked() {
+        btnReconnectExecutor.isEnabled = false
+        btnReconnectExecutor.text = "🔄 重新探测中（约5~11秒）..."
+        tvActualExecutor.text = "执行方式: ⏳ 重新探测执行器..."
+        tvActualExecutor.setTextColor(getColor(R.color.text_secondary))
+        try {
+            // 优先复用服务；没启动就先启动
+            val testIntent = Intent(this@MainActivity, GuardService::class.java).apply {
+                action = if (serviceRunning) GuardService.ACTION_RECONNECT_EXECUTOR else GuardService.ACTION_START
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(testIntent)
+            } else {
+                startService(testIntent)
+            }
+            // 如果刚启动服务，额外再发一条 RECONNECT（等服务初始化好后才处理）
+            if (!serviceRunning) {
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    try {
+                        val reconnect = Intent(this@MainActivity, GuardService::class.java).apply {
+                            action = GuardService.ACTION_RECONNECT_EXECUTOR
+                        }
+                        startService(reconnect)
+                    } catch (_: Throwable) {}
+                }, 1500L)
+                serviceRunning = true
+                tvStatus.text = "启动中..."
+                btnStart.isEnabled = false
+                btnStop.isEnabled = true
+                ensureLocalPollerStarted()
+            }
+            // 最长13秒兜底：探测超时强制恢复按钮，防止卡死
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (!isDestroyed && !btnReconnectExecutor.isEnabled) {
+                    btnReconnectExecutor.isEnabled = true
+                    btnReconnectExecutor.text = "🔄 重试连接（重新检测 Shizuku/Root）"
+                }
+            }, 13_000L)
+            // 探测完成回调（收到 ACTUAL_EXECUTOR_CHANGED 时会恢复按钮）
+        } catch (e: Throwable) {
+            btnReconnectExecutor.isEnabled = true
+            btnReconnectExecutor.text = "🔄 重试连接失败: ${e.message}"
+            Toast.makeText(this, "重试连接失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
      * 独立的 CPU 八核详情卡片 UI 渲染（与上面 updateMetricsUi 完全分开，不修改原卡片）
      *
      * P1-4b 增强：
@@ -854,11 +1044,23 @@ class MainActivity : AppCompatActivity() {
             val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
             mainHandler.postDelayed({
                 if (tvStatus.text?.startsWith("启动中") == true) {
-                    tvStatus.text = "启动超时（本地监控继续）"
+                    // Fix-6: 明确区分「采集监控正常 / 执行保护不可用」
+                    tvStatus.text = "启动超时" +
+                            "\n✅ 采集监控正常（FPS/CPU/GPU/温度继续刷新）" +
+                            "\n❌ 执行保护不可用（Shizuku/Root未就绪）"
+                    tvStatus.setTextColor(getColor(R.color.warning))
                     btnStart.isEnabled = true
                     btnStop.isEnabled = false
                     serviceRunning = false
                     startLocalPoller()
+                    // 显示重试连接按钮，不用重启APP
+                    btnReconnectExecutor.visibility = android.view.View.VISIBLE
+                    // 同时显示Shizuku引导按钮
+                    btnLaunchShizuku.visibility = android.view.View.VISIBLE
+                    // 给用户一个Toast提示
+                    Toast.makeText(this@MainActivity,
+                        "启动超时：采集数据仍正常显示\n但保护功能需Shizuku/Root权限\n请点击「重试连接」或「启动Shizuku」",
+                        Toast.LENGTH_LONG).show()
                 }
             }, 8000L)
         } catch (e: Exception) {

@@ -60,60 +60,144 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
     }
 
     /**
-     * ===== P1-1: 详细的 Shizuku 连接状态检测 =====
-     * 提供给UI显示明确的错误提示和引导按钮
+     *  ===== Fix-1：彻底重写 getDetailedStatus()，不再依赖 initialized 标志 =====
+     *
+     * 根因：MainActivity.checkPermissionStatus 会直接 new ShizukuActionExecutor() 调 getDetailedStatus()，
+     * 但 initialize() 只有在 ExecutionManager 内部启动时才调用，导致 initialized=false 永远 INITIALIZING。
+     *
+     * 修复策略：不管 initialize() 有没有被调用，getDetailedStatus() 都能基于真实探测给出明确结论。
+     * 探测步骤按无阻塞顺序进行，每一步加 Log.d 便于定位。
+     * 禁止在调用方线程做 CountDownLatch.await！
      */
     override fun getDetailedStatus(): ShizukuDetailedStatus {
-        // 1. 先检查是否安装
-        val pm = context.packageManager
-        val packages = try { pm.getInstalledPackages(0) } catch (_: Exception) { emptyList() }
-        val hasShizuku = packages.any { it.packageName == SHIZUKU_PACKAGE }
-        val hasSui = packages.any { it.packageName == SUI_PACKAGE }
-
+        // Step 1：检查 Shizuku/Sui 是否安装（纯 PackageManager 查询，无阻塞无异常）
+        val hasShizuku = try {
+            context.packageManager.getPackageInfo(SHIZUKU_PACKAGE, 0) != null
+        } catch (_: Throwable) { false }
+        val hasSui = try {
+            context.packageManager.getPackageInfo(SUI_PACKAGE, 0) != null
+        } catch (_: Throwable) { false }
+        Log.d(TAG, "[Status] Step1 install check: shizuku=$hasShizuku, sui=$hasSui")
         if (!hasShizuku && !hasSui) {
             return ShizukuDetailedStatus.NOT_INSTALLED
         }
 
-        // 2. 如果还没初始化，告诉UI正在初始化
-        if (!initialized && handlerThread?.isAlive != true) {
-            return ShizukuDetailedStatus.INITIALIZING
-        }
-
-        // 3. 已初始化的情况：看是否用了Binder
-        if (initialized) {
-            return if (useShizukuApi) {
-                // 4. 最后验证权限是否依然有效
-                try {
-                    if (Shizuku.pingBinder()) {
-                        ShizukuDetailedStatus.BINDER_OK
-                    } else {
-                        ShizukuDetailedStatus.SERVICE_NOT_RUNNING
-                    }
-                } catch (_: Throwable) {
-                    ShizukuDetailedStatus.SERVICE_NOT_RUNNING
-                }
-            } else {
-                ShizukuDetailedStatus.USING_FALLBACK_SHELL
-            }
-        }
-
-        // 4. 初始化失败：尝试判断原因（不阻塞，只是诊断）
-        return try {
-            val binderAlive = try { Shizuku.pingBinder() } catch (_: Throwable) { false }
-            if (!binderAlive) {
-                ShizukuDetailedStatus.SERVICE_NOT_RUNNING
-            } else {
-                // Binder alive但initialize失败=权限没给
-                val uid = try { Shizuku.getUid() } catch (_: Throwable) { -1 }
-                if (uid < 0) {
-                    ShizukuDetailedStatus.PERMISSION_DENIED
+        // Step 2：如果已经 initialize 成功并用了 Binder API，直接活 ping 确认
+        if (initialized && useShizukuApi) {
+            return try {
+                if (Shizuku.pingBinder()) {
+                    Log.d(TAG, "[Status] Step2 pingBinder=ok => BINDER_OK (useShizukuApi, initialized)")
+                    ShizukuDetailedStatus.BINDER_OK
                 } else {
+                    Log.w(TAG, "[Status] Step2 pingBinder=false after initialized => SERVICE_NOT_RUNNING")
                     ShizukuDetailedStatus.SERVICE_NOT_RUNNING
                 }
+            } catch (t: Throwable) {
+                Log.w(TAG, "[Status] Step2 pingBinder exception=${t.javaClass.simpleName}: ${t.message}")
+                ShizukuDetailedStatus.SERVICE_NOT_RUNNING
             }
-        } catch (_: Throwable) {
-            ShizukuDetailedStatus.UNKNOWN
         }
+        if (initialized && !useShizukuApi) {
+            Log.d(TAG, "[Status] Step2 initialized but useShizukuApi=false => USING_FALLBACK_SHELL")
+            return ShizukuDetailedStatus.USING_FALLBACK_SHELL
+        }
+
+        // Step 3：没初始化 -> 直接尝试探测 Binder + 权限。
+        // 即便 initialize() 没被调用，Shizuku.pingBinder/getUid 也能反映真实状态（Shizuku 库内部会从 Provider 拿 Service）
+        val (binderAlive, uid) = try {
+            val alive = Shizuku.pingBinder()
+            val u = if (alive) {
+                try { Shizuku.getUid() } catch (t: Throwable) {
+                    Log.w(TAG, "[Status] Step3 getUid failed: ${t.javaClass.simpleName}: ${t.message}")
+                    -2
+                }
+            } else -1
+            alive to u
+        } catch (t: Throwable) {
+            Log.w(TAG, "[Status] Step3 pingBinder exception=${t.javaClass.simpleName}: ${t.message}")
+            false to -1
+        }
+        Log.d(TAG, "[Status] Step3 probe: binderAlive=$binderAlive, uid=$uid")
+
+        return when {
+            !binderAlive -> {
+                // Shizuku/Sui APK已装但服务没启或ADB连接断开
+                ShizukuDetailedStatus.SERVICE_NOT_RUNNING
+            }
+            uid < 0 -> {
+                // Binder 通但 UID 拿不到 = 权限被拒绝（Shizuku 授权列表里本应用没开）
+                ShizukuDetailedStatus.PERMISSION_DENIED
+            }
+            else -> {
+                // Binder 通 + 权限OK → 说明 Shizuku 端已就绪，只是本类还没走 initialize 流程
+                // 此时给一个非 INITIALIZING 的"就绪但未握手"状态？这里直接判定 BINDER_OK，
+                // 因为只要 Shizuku 能用，第一次真实动作会再 ensureInitialized 握手
+                ShizukuDetailedStatus.BINDER_OK
+            }
+        }
+    }
+
+    /**
+     * ===== Fix-1：异步安全初始化（5 秒超时 + 每步 Log + 结果回调）=====
+     *
+     * 绝不阻塞调用方线程。若调用方是 UI 线程，也能立刻返回，超时后回调 onResult(INITIALIZING)。
+     * 初始化成功/失败后会刷新 initialized / useShizukuApi 标志，下一次 getDetailedStatus() 即反映真实状态。
+     *
+     * @param timeoutMs 超时时间（建议 5000）
+     * @param onResult 初始化完成/超时回调（主线程执行，便于直接刷新 UI）
+     */
+    fun ensureInitializedAsync(
+        timeoutMs: Long = 5000L,
+        onResult: (ShizukuDetailedStatus) -> Unit
+    ) {
+        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        val startAt = System.currentTimeMillis()
+        val done = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        val finish: (ShizukuDetailedStatus) -> Unit = { status ->
+            if (done.compareAndSet(false, true)) {
+                Log.i(TAG, "[ensureInitializedAsync] finish in ${System.currentTimeMillis() - startAt}ms => $status")
+                mainHandler.post { onResult(status) }
+            }
+        }
+
+        // 超时兜底：无论内部线程挂没挂住，timeoutMs 后强制回调 INITIALIZING（调用方据此降级）
+        mainHandler.postDelayed({
+            finish(ShizukuDetailedStatus.INITIALIZING)
+        }, timeoutMs)
+
+        // 真实初始化工作在 HandlerThread 后台线程执行，CountDownLatch 只阻塞后台线程
+        Thread {
+            try {
+                val stepStart = System.currentTimeMillis()
+                Log.i(TAG, "[ensureInitAsync] Step start background thread")
+                if (handlerThread?.isAlive != true) {
+                    handlerThread = HandlerThread("ShizukuInit")
+                    handlerThread!!.start()
+                    handler = Handler(handlerThread!!.looper)
+                }
+                Log.d(TAG, "[ensureInitAsync] Step1 handlerThread start in ${System.currentTimeMillis() - stepStart}ms")
+
+                val initOk = runOnBackgroundWithTimeout(timeoutMs - 500) {   // 给超时兜底留 500ms 余量
+                    try {
+                        initializeShizukuInternal()
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "[ensureInitAsync] initializeShizukuInternal exception", t)
+                        false
+                    }
+                } ?: false
+
+                initialized = initOk
+                Log.i(TAG, "[ensureInitAsync] Step2 initializeShizukuInternal result=$initOk, " +
+                        "useShizukuApi=$useShizukuApi in ${System.currentTimeMillis() - stepStart}ms")
+
+                // 最终再调用 getDetailedStatus() 把真实状态回传给 UI
+                finish(getDetailedStatus())
+            } catch (t: Throwable) {
+                Log.e(TAG, "[ensureInitAsync] fatal exception: ${t.message}", t)
+                finish(ShizukuDetailedStatus.UNKNOWN)
+            }
+        }.start()
     }
 
     override fun getStatusHumanMessage(): String {

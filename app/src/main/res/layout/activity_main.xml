@@ -105,6 +105,17 @@
                         android:text="🧪 测试保护（手动触发完整1500ms流程）"
                         android:textSize="14sp"
                         style="@style/Widget.MaterialComponents.Button.OutlinedButton"/>
+
+                    <!-- Fix-6: 重试连接执行器按钮（启动超时/Shizuku失败时显示） -->
+                    <Button
+                        android:id="@+id/btnReconnectExecutor"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="🔄 重试连接（重新检测 Shizuku/Root）"
+                        android:textSize="13sp"
+                        android:visibility="gone"
+                        android:layout_marginTop="8dp"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"/>
                 </LinearLayout>
             </LinearLayout>
         </androidx.cardview.widget.CardView>
@@ -325,7 +336,19 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:text="运行模式: 仅日志"
-                    android:textSize="14sp"/>
+                    android:textSize="14sp"
+                    android:layout_marginBottom="8dp"/>
+
+                <!-- Fix-4: 实际执行方式显示（自动选择的最终结果） -->
+                <TextView
+                    android:id="@+id/tvActualExecutor"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="执行方式: 检测中..."
+                    android:textSize="13sp"
+                    android:textColor="@color/text_secondary"
+                    android:lineSpacingExtra="2dp"
+                    android:layout_marginBottom="8dp"/>
 
                 <!-- P1-4a: Shizuku 详细引导提示（多行，含具体原因和引导） -->
                 <TextView

@@ -21,7 +21,9 @@ enum class EventType {
     ACTION_FAILED,            // 动作执行失败
     MODE_CHANGED,             // 运行模式变化
     TEST_PROTECTION_REQUESTED, // UI请求一次"测试保护"
-    TEST_PROTECTION_RESULT,    // "测试保护"执行结果
+    TEST_PROTECTION_RESULT,    // "测试保护"执行结果（含 any_success/success_count/attempted_count/error_reason/executor...）
+    ACTUAL_EXECUTOR_CHANGED,   // Fix-4: 自动选择实际执行方式完成（executor_name/detailed_status/human_message/fallback_reason）
+    EXECUTOR_RECONNECT_REQUESTED, // Fix-6: UI 请求「重试连接」重新执行初始化探测
 
     // 服务状态事件
     SERVICE_STARTED,          // 服务启动

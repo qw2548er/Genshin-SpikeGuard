@@ -245,6 +245,13 @@ class GuardService : Service() {
                     "manual" to true,
                     "requester" to "main_activity")
             }
+            // Fix-6: 主界面"重试连接"按钮 → 请求 ExecutionManager 重新探测执行器
+            ACTION_RECONNECT_EXECUTOR -> {
+                Log.i(TAG, "Received RECONNECT_EXECUTOR action, publishing EXECUTOR_RECONNECT_REQUESTED")
+                bus.publish(EventType.EXECUTOR_RECONNECT_REQUESTED,
+                    "requester" to "main_activity",
+                    "time" to System.currentTimeMillis())
+            }
         }
 
         return START_STICKY
@@ -438,5 +445,7 @@ class GuardService : Service() {
         const val ACTION_RESTART = "com.spikeguard.action.RESTART"
         // P1-3: 手动触发一次完整保护流程（供测试按钮使用）
         const val ACTION_TEST_PROTECTION = "com.spikeguard.action.TEST_PROTECTION"
+        // Fix-6: 请求重新探测执行器（Shizuku→Root→LogOnly），不用重启服务
+        const val ACTION_RECONNECT_EXECUTOR = "com.spikeguard.action.RECONNECT_EXECUTOR"
     }
 }

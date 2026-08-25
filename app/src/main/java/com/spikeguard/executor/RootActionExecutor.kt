@@ -26,25 +26,117 @@ class RootActionExecutor : ActionExecutor {
     override val name = "Root"
 
     /**
-     * P1-1: Root 模式的详细状态
+     * ===== Fix-1：Root 模式详细状态探测（不依赖 initialized 标志）=====
+     *
+     * 根因：UI 检测阶段永远不会调用 initialize()，导致 initialized=false 永远返回 INITIALIZING。
+     * 修复策略：用非阻塞探测决定最终状态，不阻塞调用方线程。
      */
     override fun getDetailedStatus(): ShizukuDetailedStatus {
-        if (!initialized && rootSession == null) {
-            return ShizukuDetailedStatus.INITIALIZING
+        // Step 1：已初始化并且会话还在 → BINDER_OK
+        if (initialized && rootSession != null) {
+            return try {
+                // 检测 su 进程是否还活着（exitValue 若未退出抛 IllegalThreadStateException）
+                rootSession!!.exitValue()
+                // 若能走到这里说明进程已退出 → 重建
+                ShizukuDetailedStatus.SERVICE_NOT_RUNNING
+            } catch (_: IllegalThreadStateException) {
+                // 还在运行 → OK
+                ShizukuDetailedStatus.BINDER_OK
+            } catch (_: Throwable) {
+                ShizukuDetailedStatus.SERVICE_NOT_RUNNING
+            }
         }
-        return if (initialized && rootSession != null) {
-            ShizukuDetailedStatus.BINDER_OK
-        } else {
-            ShizukuDetailedStatus.NOT_INSTALLED
+
+        // Step 2：检查 su 二进制是否存在（非阻塞，纯文件存在性检查）
+        val suExists = try {
+            val paths = arrayOf(
+                "/system/bin/su", "/system/xbin/su", "/sbin/su",
+                "/system/su", "/su/bin/su", "/debug_ramdisk/su",
+                "/data/adb/ksu/bin/ksud"
+            )
+            paths.any { p ->
+                try { java.io.File(p).exists() } catch (_: Throwable) { false }
+            } || Runtime.getRuntime().exec("which su").inputStream.bufferedReader().readLine()?.isNotBlank() == true
+        } catch (_: Throwable) { false }
+        Log.d(TAG, "[Status] su binary exists=$suExists")
+
+        if (!suExists) {
+            return ShizukuDetailedStatus.NOT_INSTALLED
         }
+        // su 在但还没握手 → 显示 SERVICE_NOT_RUNNING（用户需要手动点重试让 su 弹授权）
+        return ShizukuDetailedStatus.SERVICE_NOT_RUNNING
     }
 
     override fun getStatusHumanMessage(): String {
         return when (getDetailedStatus()) {
             ShizukuDetailedStatus.BINDER_OK -> "✅ Root 权限已获取（su会话已建立）"
-            ShizukuDetailedStatus.INITIALIZING -> "⏳ 正在请求Root权限..."
+            ShizukuDetailedStatus.INITIALIZING -> "⏳ 正在请求Root权限（5秒内未响应请点重试）"
+            ShizukuDetailedStatus.SERVICE_NOT_RUNNING ->
+                "⚠️ su 可用但未建立会话\n请点击下方「重试连接」或手动触发超级用户授权弹窗（Magisk/KernelSU）"
             else -> "❌ Root不可用\n请确保设备已Root并授予本应用超级用户权限（Magisk/KernelSU等）"
         }
+    }
+
+    /**
+     * ===== Fix-1：Root 异步安全初始化（5秒超时，后台线程执行）=====
+     */
+    fun ensureInitializedAsync(
+        timeoutMs: Long = 5000L,
+        onResult: (ShizukuDetailedStatus) -> Unit
+    ) {
+        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        val startAt = System.currentTimeMillis()
+        val done = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        val finish: (ShizukuDetailedStatus) -> Unit = { status ->
+            if (done.compareAndSet(false, true)) {
+                Log.i(TAG, "[ensureInitializedAsync] finish in ${System.currentTimeMillis() - startAt}ms => $status")
+                mainHandler.post { onResult(status) }
+            }
+        }
+        mainHandler.postDelayed({ finish(ShizukuDetailedStatus.INITIALIZING) }, timeoutMs)
+
+        Thread {
+            try {
+                val ok = try {
+                    // 先关旧会话（避免死进程）
+                    try { outputStream?.close() } catch (_: Throwable) {}
+                    try { rootSession?.destroy() } catch (_: Throwable) {}
+                    val proc = Runtime.getRuntime().exec("su")
+                    val os = DataOutputStream(proc.outputStream)
+                    os.writeBytes("id >/dev/null 2>&1\necho SPIKEGUARD_ROOT_OK=$?\n")
+                    os.flush()
+                    val sb = StringBuilder()
+                    val reader = proc.inputStream.bufferedReader()
+                    val deadline = System.currentTimeMillis() + (timeoutMs - 500)
+                    while (System.currentTimeMillis() < deadline) {
+                        val line = reader.readLine() ?: break
+                        sb.append(line)
+                        if (line.contains("SPIKEGUARD_ROOT_OK=0")) break
+                    }
+                    val success = sb.contains("SPIKEGUARD_ROOT_OK=0")
+                    if (success) {
+                        rootSession = proc
+                        outputStream = os
+                        initialized = true
+                        Log.i(TAG, "[ensureInitAsync] Root session established")
+                        true
+                    } else {
+                        try { os.close() } catch (_: Throwable) {}
+                        try { proc.destroy() } catch (_: Throwable) {}
+                        false
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "[ensureInitAsync] Root handshake exception: ${t.message}", t)
+                    false
+                }
+                initialized = ok
+                finish(getDetailedStatus())
+            } catch (t: Throwable) {
+                Log.e(TAG, "[ensureInitAsync] fatal exception: ${t.message}", t)
+                finish(ShizukuDetailedStatus.UNKNOWN)
+            }
+        }.start()
     }
 
     private var rootSession: Process? = null

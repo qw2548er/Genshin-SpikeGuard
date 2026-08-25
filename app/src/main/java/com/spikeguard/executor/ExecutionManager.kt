@@ -63,17 +63,29 @@ class ExecutionManager(
                 onModeChanged(event)
             }
         }
-        // 订阅"测试保护"指令（来自UI的手动触发）
-        bus.subscribe(EventType.TEST_PROTECTION_REQUESTED) { event ->
+        // Fix-6: 订阅「重试连接」请求（主界面按钮触发 → 重新执行执行器探测）
+        bus.subscribe(EventType.EXECUTOR_RECONNECT_REQUESTED) { _ ->
             executorHandler?.post {
-                val result = executeTestProtection()
+                android.util.Log.i(TAG, "EXECUTOR_RECONNECT_REQUESTED received → reinitializeExecutor")
+                reinitializeExecutor()
+            }
+        }
+        // 订阅"测试保护"指令（来自UI的手动触发）
+        bus.subscribe(EventType.TEST_PROTECTION_REQUESTED) { _ ->
+            executorHandler?.post {
+                val (result, errorReason) = executeTestProtectionWithReason()
+                android.util.Log.i(TAG, "TEST_PROTECTION_RESULT: ok=${result.successCount}/${result.attemptedCount}, " +
+                        "reason=$errorReason, executor=${currentExecutor?.name}")
                 bus.publish(
                     EventType.TEST_PROTECTION_RESULT,
                     "any_success" to result.anySuccess,
                     "success_count" to result.successCount,
                     "attempted_count" to result.attemptedCount,
                     "total_ms" to result.totalMs,
-                    "executor" to (currentExecutor?.name ?: "none")
+                    "executor" to (currentExecutor?.name ?: "none"),
+                    // Fix-5: 携带具体失败原因，UI据此给不同提示
+                    "error_reason" to errorReason,
+                    "detailed_status" to (currentExecutor?.getDetailedStatus()?.name ?: "NULL")
                 )
             }
         }
@@ -160,9 +172,22 @@ class ExecutionManager(
     fun isPaused(): Boolean = isPaused
 
     /**
-     * 初始化执行器（在后台线程调用）
+     * Fix-6：外部（UI「重试连接」按钮）请求重新探测执行器
      */
-    private fun initializeExecutor() {
+    fun reinitializeExecutor() {
+        initializeExecutor(forceProbe = true)
+    }
+
+    /**
+     * 初始化执行器（在后台线程调用）
+     *
+     * Fix-4：**不再看 configManager.getPermissionMode()**
+     * 固定优先级探测顺序：Shizuku Binder → Root Shell → LogOnly。
+     * 用户哪怕把权限模式关了也没关系，自动选当前设备能用的最强方式。
+     * 每个阶段 5 秒超时，超时失败尝试下一等级。
+     * 探测完成后 publish ACTUAL_EXECUTOR_CHANGED 让 UI 实时刷新。
+     */
+    private fun initializeExecutor(forceProbe: Boolean = false) {
         val runMode = configManager.getRunMode()
 
         try {
@@ -172,69 +197,105 @@ class ExecutionManager(
         }
         currentExecutor = null
 
-        currentExecutor = when (runMode) {
-            RunMode.FULL_PROTECT -> {
-                // 根据权限模式选择执行器
-                val permMode = configManager.getPermissionMode()
-                when (permMode) {
-                    PermissionMode.ROOT -> {
-                        val executor = RootActionExecutor()
-                        if (executor.isAvailable()) {
-                            try {
-                                if (executor.initialize()) {
-                                    executor
-                                } else {
-                                    android.util.Log.w(TAG, "Root init failed, falling back to LogOnly")
-                                    LogOnlyExecutor().also { it.initialize() }
-                                }
-                            } catch (e: Exception) {
-                                android.util.Log.e(TAG, "Root init exception", e)
-                                LogOnlyExecutor().also { it.initialize() }
-                            }
-                        } else {
-                            android.util.Log.w(TAG, "Root not available, falling back to LogOnly")
-                            LogOnlyExecutor().also { it.initialize() }
-                        }
-                    }
-                    PermissionMode.SHIZUKU -> {
-                        val executor = ShizukuActionExecutor(context)
-                        if (executor.isAvailable()) {
-                            try {
-                                if (executor.initialize()) {
-                                    executor
-                                } else {
-                                    android.util.Log.w(TAG, "Shizuku init failed, falling back to LogOnly")
-                                    LogOnlyExecutor().also { it.initialize() }
-                                }
-                            } catch (e: Exception) {
-                                android.util.Log.e(TAG, "Shizuku init exception", e)
-                                LogOnlyExecutor().also { it.initialize() }
-                            }
-                        } else {
-                            android.util.Log.w(TAG, "Shizuku not available, falling back to LogOnly")
-                            LogOnlyExecutor().also { it.initialize() }
-                        }
-                    }
-                    PermissionMode.NONE -> {
-                        android.util.Log.w(TAG, "No permission mode set, using LogOnly")
-                        LogOnlyExecutor().also { it.initialize() }
+        // 1) 纯日志模式：快速路径
+        if (runMode == RunMode.LOG_ONLY) {
+            val exec = LogOnlyExecutor().also { it.initialize() }
+            currentExecutor = exec
+            android.util.Log.i(TAG, "Mode=LOG_ONLY, using LogOnlyExecutor")
+            publishModeChanged(runMode, exec)
+            publishActualExecutorChanged(exec, "RUNMODE_LOGONLY")
+            return
+        }
+
+        // 2) FULL_PROTECT：按 Shizuku → Root → LogOnly 顺序探测（阻塞但总超时5+5=10s）
+        //    为避免阻塞整个执行器Handler 10秒，这里用 CountDownLatch 把异步回调转同步等待，
+        //    但整个方法仍在 ExecutorManager 自己的后台 HandlerThread 上执行，所以不阻塞主线程。
+        android.util.Log.i(TAG, "FULL_PROTECT: start auto-probe (Shizuku → Root → LogOnly)")
+        val timeoutPerStage = 5000L
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var fallbackReason = "FALLBACK_NONE"
+        var chosen: ActionExecutor? = null
+
+        // === Stage 1: Shizuku ===
+        val shizuku = ShizukuActionExecutor(context)
+        val s0 = shizuku.getDetailedStatus()
+        android.util.Log.i(TAG, "Probe Shizuku: pre-probe status=$s0")
+        shizuku.ensureInitializedAsync(timeoutPerStage) { result ->
+            android.util.Log.i(TAG, "Probe Shizuku: async handshake result=$result")
+            if (result == ShizukuDetailedStatus.BINDER_OK) {
+                chosen = shizuku
+                fallbackReason = "SHIZUKU_BINDER_OK"
+                latch.countDown()
+            } else {
+                // Shizuku 握手失败 → 尝试 Root
+                val shizukuFailReason = when (result) {
+                    ShizukuDetailedStatus.NOT_INSTALLED -> "SHIZUKU_NOT_INSTALLED"
+                    ShizukuDetailedStatus.SERVICE_NOT_RUNNING -> "SHIZUKU_SERVICE_NOT_RUNNING"
+                    ShizukuDetailedStatus.PERMISSION_DENIED -> "SHIZUKU_PERMISSION_DENIED"
+                    ShizukuDetailedStatus.INITIALIZING -> "SHIZUKU_HANDSHAKE_TIMEOUT"
+                    else -> "SHIZUKU_FALLBACK_${result.name}"
+                }
+                val root = RootActionExecutor()
+                val r0 = root.getDetailedStatus()
+                android.util.Log.i(TAG, "Probe Root: pre-probe status=$r0")
+                root.ensureInitializedAsync(timeoutPerStage) { rResult ->
+                    android.util.Log.i(TAG, "Probe Root: async handshake result=$rResult")
+                    if (rResult == ShizukuDetailedStatus.BINDER_OK) {
+                        chosen = root
+                        fallbackReason = "ROOT_OK (after $shizukuFailReason)"
+                        latch.countDown()
+                    } else {
+                        // Shizuku 和 Root 都失败 → 降级 LogOnly
+                        val logOnly = LogOnlyExecutor().also { it.initialize() }
+                        chosen = logOnly
+                        fallbackReason = "LOGONLY (shizukuReason=$shizukuFailReason, root=$rResult)"
+                        latch.countDown()
                     }
                 }
             }
-            RunMode.LOG_ONLY -> {
-                // 纯日志模式：直接使用LogOnlyExecutor，完全不调用Shizuku/Root
-                android.util.Log.i(TAG, "Log only mode - no Shizuku/Root calls will be made")
-                LogOnlyExecutor().also { it.initialize() }
-            }
         }
 
-        android.util.Log.i(TAG, "Executor initialized: ${currentExecutor?.name}")
+        // 总兜底：如果两级异步回调都没触发（极端情况），11s 后强制解阻塞用 LogOnly
+        val totalDeadline = System.currentTimeMillis() + timeoutPerStage * 2 + 1000
+        while (latch.count > 0 && System.currentTimeMillis() < totalDeadline) {
+            if (!latch.await(50, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                // 继续循环直到超时
+            }
+        }
+        if (latch.count > 0) {
+            android.util.Log.w(TAG, "Auto-probe total timeout → 强制降级 LogOnly")
+            chosen = LogOnlyExecutor().also { it.initialize() }
+            fallbackReason = "PROBE_TOTAL_TIMEOUT → LOGONLY"
+        }
 
-        // 发布模式变更
+        val exec = chosen ?: LogOnlyExecutor().also { it.initialize() }
+        currentExecutor = exec
+        android.util.Log.i(TAG, "Auto-probe finished: chosen=${exec.name}, reason=$fallbackReason")
+        publishModeChanged(runMode, exec)
+        publishActualExecutorChanged(exec, fallbackReason)
+    }
+
+    private fun publishModeChanged(runMode: RunMode, exec: ActionExecutor) {
         bus.publish(
             EventType.MODE_CHANGED,
             "run_mode" to runMode.name,
-            "executor" to (currentExecutor?.name ?: "none")
+            "executor" to exec.name
+        )
+    }
+
+    /**
+     * Fix-4：通知所有订阅者实际执行器的最终选择（UI更新显示、日志记录等）
+     */
+    private fun publishActualExecutorChanged(exec: ActionExecutor, fallbackReason: String) {
+        val status = try { exec.getDetailedStatus() } catch (_: Throwable) { ShizukuDetailedStatus.UNKNOWN }
+        val msg = try { exec.getStatusHumanMessage() } catch (_: Throwable) { "异常" }
+        android.util.Log.i(TAG, "ACTUAL_EXECUTOR_CHANGED => ${exec.name}, status=$status, reason=$fallbackReason")
+        bus.publish(
+            EventType.ACTUAL_EXECUTOR_CHANGED,
+            "executor_name" to exec.name,
+            "detailed_status" to status.name,
+            "human_message" to msg,
+            "fallback_reason" to fallbackReason
         )
     }
 
@@ -332,28 +393,73 @@ class ExecutionManager(
     }
 
     /**
-     * 对外公开：手动触发一次"测试保护"完整流程
-     * 供UI上的"测试保护"按钮调用，使用标准/激进强度参数验证执行模块真的在干活
+     * Fix-5：手动触发一次"测试保护"完整流程
+     * 返回 Pair<FullFlowResult, String>
+     * 第二个元素 error_reason 是给 UI 用的失败原因枚举：
+     *   OK                      → 流程执行完且至少1步成功
+     *   NO_EXECUTOR             → ExecutionManager 尚未初始化
+     *   PAUSED_SILENT           → 当前处于静默期
+     *   LOGONLY_NO_PERM         → 用的是 LogOnly（纯日志，没权限）
+     *   SHIZUKU_NOT_READY       → Shizuku 详细状态不是 BINDER_OK
+     *   ROOT_NOT_READY          → Root 详细状态不是 BINDER_OK
+     *   EXECUTION_ALL_FAILED    → 4/5 步全部失败（权限可能假授权）
+     *   EXECUTION_EXCEPTION     → 抛异常
      */
-    fun executeTestProtection(): FullFlowResult {
-        val executor = currentExecutor ?: return FullFlowResult(null, null, null, null, null, 0, 0, 0)
+    private fun executeTestProtectionWithReason(): Pair<FullFlowResult, String> {
+        val executor = currentExecutor
+        if (executor == null) {
+            return FullFlowResult(null, null, null, null, null, 0, 0, 0) to "NO_EXECUTOR_SERVICE_NOT_STARTED"
+        }
         if (isPaused) {
-            android.util.Log.w(TAG, "Test protection skipped: paused")
-            return FullFlowResult(null, null, null, null, null, 0, 0, 0)
+            android.util.Log.w(TAG, "Test protection skipped: paused (silent mode)")
+            return FullFlowResult(null, null, null, null, null, 0, 0, 0) to "PAUSED_SILENT"
+        }
+
+        val status = try { executor.getDetailedStatus() } catch (_: Throwable) { ShizukuDetailedStatus.UNKNOWN }
+        when {
+            executor is LogOnlyExecutor -> {
+                // 纯日志：快速返回并标注原因
+                val r = safeExecuteFlow {
+                    executor.executeFullProtectionFlow(true, 0.55f, 0.7f, true,
+                        detectGenshinPackage() ?: "com.miHoYo.Yuanshen", 1500L)
+                }
+                return r to if (r.anySuccess) "OK_LOGONLY_EXPECTED" else "LOGONLY_NO_PERMISSION"
+            }
+            executor is ShizukuActionExecutor && status != ShizukuDetailedStatus.BINDER_OK -> {
+                return FullFlowResult(null, null, null, null, null, 0, 0, 0) to
+                        "SHIZUKU_${status.name}"
+            }
+            executor is RootActionExecutor && status != ShizukuDetailedStatus.BINDER_OK -> {
+                return FullFlowResult(null, null, null, null, null, 0, 0, 0) to
+                        "ROOT_${status.name}"
+            }
         }
 
         val targetPackage = detectGenshinPackage() ?: "com.miHoYo.Yuanshen"
-        android.util.Log.i(TAG, "TEST PROTECTION starting via ${executor.name}")
+        android.util.Log.i(TAG, "TEST PROTECTION starting via ${executor.name}, status=$status")
 
-        return safeExecuteFlow {
-            executor.executeFullProtectionFlow(
+        val startAt = System.currentTimeMillis()
+        return try {
+            val r = executor.executeFullProtectionFlow(
                 reclaimMemory = true,
-                gpuThrottle = 0.55f,       // 标准保护强度
+                gpuThrottle = 0.55f,
                 cpuThrottle = 0.7f,
                 boostPriority = true,
                 targetPackageName = targetPackage,
                 durationMs = 1500L
             )
+            android.util.Log.i(TAG, "TEST PROTECTION flow done in ${System.currentTimeMillis() - startAt}ms: " +
+                    "${r.successCount}/${r.attemptedCount}")
+            when {
+                r.anySuccess -> r to "OK"
+                r.attemptedCount == 0 -> r to "EXECUTION_NO_ATTEMPTS"
+                else -> r to "EXECUTION_ALL_STEPS_FAILED"
+            }
+        } catch (t: Throwable) {
+            android.util.Log.e(TAG, "TEST PROTECTION exception: ${t.message}", t)
+            val fail = ActionResult(ActionType.FULL_FLOW, false, "Exception: ${t.message}")
+            FullFlowResult(fail, fail, fail, fail, fail, System.currentTimeMillis() - startAt, 0, 1) to
+                    "EXECUTION_EXCEPTION_${t.javaClass.simpleName}"
         }
     }
 
