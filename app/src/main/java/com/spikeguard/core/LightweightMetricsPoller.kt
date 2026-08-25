@@ -1,6 +1,10 @@
 package com.spikeguard.core
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -26,11 +30,11 @@ class LightweightMetricsPoller(
 ) {
 
     data class MetricsSnapshot(
-        val gpuLoad: Float,   // 0-100, 0f=未知
-        val cpuLoad: Float,   // 0-100, 0f=未知
-        val temperature: Float, // ℃, 0f=未知
-        val fps: Int,           // -1=未知
-        val entityEstimate: Int // 0-200 估算
+        val gpuLoad: Float,   // -1f=未知, 0-100 真实值
+        val cpuLoad: Float,   // -1f=未知, 0-100 真实值
+        val temperature: Float, // -1f=未知, 其余为真实℃
+        val fps: Int,           // -1=未知, 0-120 真实FPS
+        val entityEstimate: Int // -1=未知, 0-200 估算
     )
 
     private var workerThread: HandlerThread? = null
@@ -46,6 +50,29 @@ class LightweightMetricsPoller(
     // FPS
     private var lastLatencyLineCount = -1L
     private var lastLatencyAt = 0L
+
+    // GPU：动态探测出的"有效路径"会在第一次扫描后缓存下来，避免每秒全机扫描
+    @Volatile private var cachedGpuBusyPath: String? = null
+    @Volatile private var cachedGpuFreqPath: String? = null
+    @Volatile private var cachedDevfreqDirName: String? = null // 例："devfreq0"
+    private var gpuProbeDone = false
+
+    // 电池温度：用 sticky Intent（ACTION_BATTERY_CHANGED），这是所有"设备信息"类App
+    // 读取电池温度的标准官方方式（用户截图里"概览"页43.5℃ 就来自这里）。
+    // 用 BroadcastReceiver 一次性取一次 sticky，不注册常驻监听，避免内存泄漏。
+    private fun readBatteryTemperatureOfficial(): Float {
+        return try {
+            val ifilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            val batteryStatus: Intent? = context.registerReceiver(null, ifilter)
+            if (batteryStatus == null) return -1f
+            val raw = batteryStatus.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+            if (raw == Int.MIN_VALUE) return -1f
+            // BatteryManager 约定：返回值是 10 倍放大的 ℃（435 = 43.5℃，对应用户第一张概览截图）
+            (raw.toFloat() / 10f).coerceIn(-1f, 120f)
+        } catch (_: Throwable) {
+            -1f
+        }
+    }
 
     @Volatile
     private var running = false
@@ -102,229 +129,334 @@ class LightweightMetricsPoller(
     private fun readCpuLoad(): Float {
         return try {
             val stat = java.io.File("/proc/stat").readText()
-            val first = stat.lineSequence().firstOrNull() ?: return 0f
+            val first = stat.lineSequence().firstOrNull() ?: return -1f
             val parts = first.trim().split("\\s+".toRegex())
-            if (parts.size < 8) return 0f
-            val user = parts[1].toLongOrNull() ?: 0L
-            val nice = parts[2].toLongOrNull() ?: 0L
-            val sys = parts[3].toLongOrNull() ?: 0L
-            val idle = parts[4].toLongOrNull() ?: 0L
-            val iow = parts[5].toLongOrNull() ?: 0L
-            val irq = parts[6].toLongOrNull() ?: 0L
-            val sirq = parts[7].toLongOrNull() ?: 0L
+            if (parts.size < 8) return -1f
+            val user = parts[1].toLongOrNull() ?: return -1f
+            val nice = parts[2].toLongOrNull() ?: return -1f
+            val sys = parts[3].toLongOrNull() ?: return -1f
+            val idle = parts[4].toLongOrNull() ?: return -1f
+            val iow = parts[5].toLongOrNull() ?: return -1f
+            val irq = parts[6].toLongOrNull() ?: return -1f
+            val sirq = parts[7].toLongOrNull() ?: return -1f
             val total = user + nice + sys + idle + iow + irq + sirq
             val idleT = idle + iow
             if (!cpuReady) {
-                lastCpuTotal = total; lastCpuIdle = idleT; cpuReady = true; return 0f
+                lastCpuTotal = total; lastCpuIdle = idleT; cpuReady = true
+                return -1f // 第一帧只有基准，没有差分结果 → 未知，不返回假 0
             }
             val dt = total - lastCpuTotal
             val di = idleT - lastCpuIdle
             lastCpuTotal = total; lastCpuIdle = idleT
-            if (dt <= 0) return 0f
+            if (dt <= 0) return -1f
             (((dt - di).toFloat() / dt.toFloat()) * 100f).coerceIn(0f, 100f)
-        } catch (_: Throwable) { 0f }
+        } catch (_: Throwable) { -1f }
     }
 
-    // ============== GPU：适配天玑9300 PowerVR BXM（荣耀X60芯片页截图确认）==============
-    // 优先级：mtk_gpufreq/proc > devfreq（安卓标准DF框架）> PowerVR debugfs > kgsl(高通兜底)
-    private val gpuBusyPaths = listOf(
-        // MTK 专用优先（天玑9300必带 /proc/mtk_gpufreq/）
-        "/proc/mtk_gpufreq/gpu_busy_percent",
-        "/proc/mtk_gpufreq/GPU_BUSY_PERCENT",
-        "/sys/kernel/gpu/gpu_busy",
-        "/sys/kernel/debug/pvr/status",                // PowerVR debugfs 状态
-        // devfreq 标准路径：/sys/class/devfreq/*/load（安卓DF，通用于非高通SoC）
-        "/sys/class/devfreq/devfreq0/load",
-        "/sys/class/devfreq/devfreq1/load",
-        "/sys/class/devfreq/devfreq2/load",
-        // PowerVR / Mali 兜底
-        "/sys/devices/platform/pvrsrvkm/gpuutilisation",
-        "/sys/class/misc/mali0/device/utilization",
-        // 高通 Adreno（兜底兼容其他机器）
-        "/sys/class/kgsl/kgsl-3d0/gpubusy",
-        "/sys/devices/platform/soc/1c00000.gpu/gpu_busy"
-    )
+    // ============== GPU：弃用猜路径，全部改"动态探测+缓存" ==============
+    // 思路：用户机器是 HONOR X60 + 天玑9300(MT6855) + PowerVR BXM-8-256
+    // 不同 ROM / 内核版本下 sysfs 具体文件名千差万别，硬编码猜不到。
+    // 这里改成：启动第 1 次采样时，真正去扫这台手机的以下目录，
+    // 把"第一个能成功读出有效数字的文件路径"缓存下来复用（真读不到就返回 -1f 显示--，绝不塞假值）。
+    //
+    // 探测范围：
+    //   A. /proc/mtk_gpufreq/ 目录下所有文件（联发科必带，里面全是 key=value）
+    //   B. /sys/class/devfreq/*/ 全部设备，先读 name，按名字匹配置信度判断是不是 GPU
+    //   C. 常见的 PowerVR / Mali / Adreno 节点（兜底，若能读到就用）
 
-    private fun readGpuLoad(): Float {
-        // 1) /proc/mtk_gpufreq 专用解析：很多行 "key=value" 形式
-        for (p in listOf("/proc/mtk_gpufreq/clk", "/proc/mtk_gpufreq/GPU_BUSY")) {
-            try {
-                val f = java.io.File(p)
-                if (!f.exists()) continue
-                val lines = f.readLines()
-                for (l in lines) {
-                    val lower = l.trim().lowercase()
-                    if (lower.contains("busy")) {
-                        val num = Regex("""(\d+(\.\d+)?)""").find(l)?.groupValues?.getOrNull(1)?.toFloatOrNull() ?: continue
-                        if (num in 0f..100f) return num
-                        if (num > 100f) return (num / 10f).coerceIn(0f, 100f)
-                    }
-                }
-            } catch (_: Throwable) {}
+    private fun isLikelyGpuDevfreqName(name: String): Boolean {
+        val lower = name.lowercase()
+        // PowerVR = pvr/bxm/bxe/bxs/rogue/imagination；Mali = mali；Adreno = kgsl/adreno；通用 gpu/g3d/
+        return lower.contains("gpu") ||
+               lower.contains("pvr") || lower.contains("bxml") || lower.contains("bxm") ||
+               lower.contains("bxe") || lower.contains("rogue") || lower.contains("img") ||
+               lower.contains("mali") ||
+               lower.contains("kgsl") || lower.contains("adreno") ||
+               lower.contains("gx6") || lower.contains("g3d") || lower.contains("ge")
+    }
+
+    private fun tryParsePercentFromString(text: String): Float? {
+        val c = text.trim()
+        if (c.isEmpty()) return null
+        // a b 格式（高通 gpubusy 标准）
+        val parts = c.split("\\s+".toRegex())
+        if (parts.size >= 2) {
+            val a = parts[0].toFloatOrNull() ?: return null
+            val b = parts[1].toFloatOrNull() ?: return null
+            if (b > 0f) return ((a / b) * 100f).coerceIn(0f, 100f)
         }
-        // 2) 单文件逐行解析
-        for (p in gpuBusyPaths) {
-            try {
-                val f = java.io.File(p)
-                if (!f.exists()) continue
-                val c = f.readText().trim()
-                if (c.isEmpty()) continue
-                // pvr/status 里找类似 "Utilization: 42%" 的行
-                if (p.contains("pvr")) {
-                    for (l in c.lineSequence()) {
-                        val lower = l.lowercase()
-                        val m = Regex("""utilization[:\s]*(\d+(\.\d+)?)""").find(lower)
-                        if (m != null) {
-                            val v = m.groupValues[1].toFloatOrNull() ?: continue
-                            return v.coerceIn(0f, 100f)
+        val v = c.toFloatOrNull() ?: return null
+        return when {
+            v in 0f..100f -> v
+            v in 100f..1000f -> (v / 10f).coerceIn(0f, 100f)
+            v > 1000f -> (v / 1000f).coerceIn(0f, 100f)
+            else -> null
+        }
+    }
+
+    private fun tryParseFreqToMhz(text: String): Float? {
+        val c = text.trim()
+        if (c.isEmpty()) return null
+        val raw = c.toIntOrNull() ?: c.toFloatOrNull()?.toInt() ?: return null
+        if (raw <= 0) return null
+        return when {
+            raw > 100_000_000 -> raw / 1_000_000f
+            raw > 100_000     -> raw / 1_000f
+            else              -> raw.toFloat()
+        }
+    }
+
+    private fun probeGpuOnceAndCache() {
+        // A. /proc/mtk_gpufreq 全部文件（天玑9300 必带）
+        try {
+            val dir = java.io.File("/proc/mtk_gpufreq/")
+            if (dir.exists() && dir.isDirectory) {
+                // 先扫一遍所有文件找带 "busy/percent/utilisation" 的
+                for (f in (dir.listFiles() ?: emptyArray()).sortedBy { it.name }) {
+                    if (!f.isFile) continue
+                    try {
+                        val lines = f.readLines()
+                        // 逐行解析 key=value / 或整文件纯数字
+                        for (l in lines) {
+                            val lower = l.lowercase()
+                            if (lower.contains("busy") || lower.contains("percent") || lower.contains("util")) {
+                                val num = Regex("""(\d+(\.\d+)?)""").find(l)?.groupValues?.getOrNull(1)?.toFloatOrNull() ?: continue
+                                if (num in 0f..100f) { cachedGpuBusyPath = f.absolutePath; return }
+                                if (num > 100f) { cachedGpuBusyPath = f.absolutePath; return }
+                            }
+                        }
+                        // 整文件纯数字（百分比如 42）
+                        val pure = tryParsePercentFromString(f.readText())
+                        if (pure != null) { cachedGpuBusyPath = f.absolutePath; return }
+
+                        // 还没找到 busy，那找有没有 freq 数字，存为 freq 路径备用
+                        for (l in lines) {
+                            val lower = l.lowercase()
+                            if (lower.contains("freq") || lower.contains("cur") || lower.contains("current")) {
+                                val m = Regex("""=\s*(\d+)""").find(l) ?: continue
+                                val khz = m.groupValues[1].toIntOrNull() ?: continue
+                                if (khz > 0) { cachedGpuFreqPath = f.absolutePath; break }
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // B. /sys/class/devfreq/* 全部设备，读 name 筛选 GPU 相关
+        try {
+            val dir = java.io.File("/sys/class/devfreq/")
+            if (dir.exists() && dir.isDirectory) {
+                val subs = dir.listFiles() ?: emptyArray()
+                // 第 1 轮：按 name 匹配置信度排序
+                val ranked = subs.mapNotNull { sub ->
+                    try {
+                        val nameF = java.io.File(sub, "name")
+                        val name = if (nameF.exists()) nameF.readText().trim() else sub.name
+                        if (isLikelyGpuDevfreqName(name)) {
+                            val score = when {
+                                name.contains("pvr", true) || name.contains("bxm", true) || name.contains("bxml", true) -> 100
+                                name.contains("gpu", true) && name.contains("freq", true) -> 90
+                                name.contains("gpu", true) -> 80
+                                name.contains("mali", true) -> 70
+                                name.contains("kgsl", true) || name.contains("adreno", true) -> 60
+                                else -> 50
+                            }
+                            sub to score
+                        } else {
+                            null
+                        }
+                    } catch (_: Throwable) { null }
+                }.sortedByDescending { it.second }
+
+                for ((sub, _) in ranked) {
+                    val loadF = java.io.File(sub, "load")
+                    try {
+                        if (loadF.exists()) {
+                            val v = tryParsePercentFromString(loadF.readText())
+                            if (v != null && v in 0f..100f) {
+                                cachedGpuBusyPath = loadF.absolutePath
+                                cachedDevfreqDirName = sub.name
+                                return
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                    val curF = java.io.File(sub, "cur_freq")
+                    try {
+                        if (curF.exists() && cachedGpuFreqPath == null) {
+                            if (tryParseFreqToMhz(curF.readText()) != null) {
+                                cachedGpuFreqPath = curF.absolutePath
+                                cachedDevfreqDirName = sub.name
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                }
+                // 第 2 轮：没命中名字但有 load/cur_freq 文件的 devfreq，随便选一个读得通的当 fallback
+                if (cachedGpuBusyPath == null) {
+                    for (sub in subs) {
+                        val loadF = java.io.File(sub, "load")
+                        if (loadF.exists()) {
+                            try {
+                                val v = tryParsePercentFromString(loadF.readText())
+                                if (v != null && v in 0f..100f) {
+                                    cachedGpuBusyPath = loadF.absolutePath
+                                    cachedDevfreqDirName = sub.name
+                                    return
+                                }
+                            } catch (_: Throwable) {}
                         }
                     }
                 }
-                // gpubusy "a b" 格式
-                val parts = c.split("\\s+".toRegex())
-                if (parts.size >= 2) {
-                    val a = parts[0].toFloatOrNull() ?: continue
-                    val b = parts[1].toFloatOrNull() ?: continue
-                    if (b > 0f) return ((a / b) * 100f).coerceIn(0f, 100f)
+            }
+        } catch (_: Throwable) {}
+
+        // C. 兜底：常见单节点名（/sys/class/kgsl 等）
+        val fallbacks = listOf(
+            "/sys/class/kgsl/kgsl-3d0/gpubusy",
+            "/sys/class/misc/mali0/device/utilization",
+            "/sys/kernel/gpu/gpu_busy",
+            "/sys/kernel/debug/pvr/status",
+            "/sys/devices/platform/pvrsrvkm/gpuutilisation"
+        )
+        for (p in fallbacks) {
+            try {
+                val f = java.io.File(p)
+                if (!f.exists()) continue
+                val v = if (p.contains("pvr/status")) {
+                    // pvr/status 文本里找 Utilization: xx%
+                    var best: Float? = null
+                    for (l in f.readLines()) {
+                        val m = Regex("""utilization[:\s]*(\d+(\.\d+)?)""").find(l.lowercase()) ?: continue
+                        best = (m.groupValues[1].toFloatOrNull() ?: continue).coerceIn(0f, 100f)
+                        break
+                    }
+                    best
                 } else {
-                    val v = c.toFloatOrNull() ?: continue
-                    if (v in 0f..100f) return v
-                    if (v in 100f..1000f) return (v / 10f).coerceIn(0f, 100f)
-                    if (v > 1000f) return (v / 1000f).coerceIn(0f, 100f) // 千分比
+                    tryParsePercentFromString(f.readText())
                 }
+                if (v != null) { cachedGpuBusyPath = p; return }
             } catch (_: Throwable) {}
         }
-        // 3) fallback：devfreq 目录全局扫一遍，找第一个带 load 的设备
-        try {
-            val dir = java.io.File("/sys/class/devfreq/")
-            if (dir.exists() && dir.isDirectory) {
-                for (sub in dir.listFiles() ?: emptyArray()) {
-                    val loadF = java.io.File(sub, "load")
-                    if (loadF.exists()) {
-                        val v = loadF.readText().trim().toFloatOrNull() ?: continue
-                        if (v > 0f) return if (v in 0f..100f) v else (v / 10f).coerceIn(0f, 100f)
-                    }
-                }
-            }
-        } catch (_: Throwable) {}
-        // 4) 最后 fallback：通过频率线性估算（0-100 映射）
-        return readGpuFreqBasedEstimate()
-    }
 
-    // GPU 频率路径：同样优先 MTK → devfreq 标准 → 高通兜底
-    // 芯片截图显示 PowerVR BXM-8-256，频率上限截图写 500MHz~2500MHz 区间（CPU/GPU合并栏），取最大~1200MHz估
-    private val gpuFreqPaths = listOf(
-        "/proc/mtk_gpufreq/clk",                 // MTK 专用 key=value
-        "/sys/class/devfreq/devfreq0/cur_freq",  // 安卓 devfreq 标准
-        "/sys/class/devfreq/devfreq1/cur_freq",
-        "/sys/class/devfreq/devfreq2/cur_freq",
-        "/sys/class/misc/mali0/device/cur_freq",
-        "/sys/kernel/gpu/gpu_freq",
-        "/sys/kernel/debug/pvr/status",
-        // 高通 Adreno（兜底）
-        "/sys/class/kgsl/kgsl-3d0/gpuclk",
-        "/sys/class/kgsl/kgsl-3d0/cur_gpuclk",
-        "/sys/devices/platform/soc/1c00000.gpu/devfreq/1c00000.gpu/cur_freq"
-    )
-
-    private fun readGpuFreqBasedEstimate(): Float {
-        // 1) /proc/mtk_gpufreq/clk 里找 "CURRENT_GPU_FREQ=..."
-        for (p in listOf("/proc/mtk_gpufreq/clk", "/proc/mtk_gpufreq/VPU_DVFS")) {
-            try {
-                val lines = java.io.File(p).readLines()
-                for (l in lines) {
-                    val lower = l.lowercase()
-                    if (lower.contains("freq") || lower.contains("cur")) {
-                        val m = Regex("""=\s*(\d+)""").find(l) ?: continue
-                        val khz = m.groupValues[1].toIntOrNull() ?: continue
-                        if (khz <= 0) continue
-                        // mtk_gpufreq 通常单位 kHz -> mhz = khz/1000
-                        val mhz = if (khz > 1000000) khz / 1000000 else khz / 1000
-                        if (mhz <= 0) continue
-                        return ((mhz.toFloat() / 1200f) * 100f).coerceIn(5f, 98f)
-                    }
-                }
-            } catch (_: Throwable) {}
-        }
-        // 2) devfreq cur_freq（单位 Hz -> MHz）
-        for (p in gpuFreqPaths) {
-            try {
-                val rawStr = java.io.File(p).readText().trim()
-                if (rawStr.isEmpty()) continue
-                val raw = rawStr.toIntOrNull() ?: continue
-                if (raw <= 0) continue
-                // devfreq cur_freq 通常 Hz，/sys/kgsl 则是 Hz 或 kHz 混合
-                val mhz = when {
-                    raw > 100_000_000 -> raw / 1_000_000       // Hz -> MHz
-                    raw > 100_000     -> raw / 1_000           // kHz -> MHz
-                    else              -> raw                    // 已经是 MHz
-                }
-                if (mhz <= 0) continue
-                return ((mhz.toFloat() / 1200f) * 100f).coerceIn(5f, 98f)
-            } catch (_: Throwable) {}
-        }
-        // 3) devfreq 目录全局扫一遍找 cur_freq
-        try {
-            val dir = java.io.File("/sys/class/devfreq/")
-            if (dir.exists() && dir.isDirectory) {
-                for (sub in dir.listFiles() ?: emptyArray()) {
-                    val f = java.io.File(sub, "cur_freq")
+        // D. 还没找到任何 busy，那找一条 cur_freq（即使没 load 也能做后续映射）
+        if (cachedGpuFreqPath == null) {
+            for (p in listOf(
+                "/sys/class/kgsl/kgsl-3d0/cur_gpuclk",
+                "/sys/class/misc/mali0/device/cur_freq",
+                "/sys/kernel/gpu/gpu_freq"
+            )) {
+                try {
+                    val f = java.io.File(p)
                     if (!f.exists()) continue
-                    val raw = f.readText().trim().toIntOrNull() ?: continue
-                    val mhz = if (raw > 100_000_000) raw / 1_000_000 else raw / 1_000
-                    if (mhz <= 0) continue
-                    return ((mhz.toFloat() / 1200f) * 100f).coerceIn(5f, 98f)
-                }
+                    if (tryParseFreqToMhz(f.readText()) != null) { cachedGpuFreqPath = p; break }
+                } catch (_: Throwable) {}
             }
-        } catch (_: Throwable) {}
-        return 0f
+        }
     }
 
-    // 温度：你第一张图"概览"页明确显示"温度：43.5℃" → 电池temp一定能读到，
-    // 因此把 /sys/class/power_supply/battery/temp 作为第一优先级（稳定、始终可读、普通app有权限）
-    private fun readTemperature(): Float {
-        // 1) 电池温度（优先，荣耀X60概览页43.5℃就是从这里来的）
-        try {
-            val batteryTempRaw = java.io.File("/sys/class/power_supply/battery/temp").readText().trim().toFloatOrNull()
-            if (batteryTempRaw != null && batteryTempRaw > 0f) {
-                // 常见返回格式是 435 表示 43.5℃（10倍放大）或直接 43.5
-                val c = if (batteryTempRaw > 200f) batteryTempRaw / 10f else batteryTempRaw
-                if (c in 0f..100f) return c
-            }
-        } catch (_: Throwable) {}
-        // 2) 老路径 battery_temp/temperature（不同ROM命名差异）
-        for (name in listOf("temperature", "battery_temp", "temp")) {
+    private fun readGpuLoad(): Float {
+        if (!gpuProbeDone) {
+            gpuProbeDone = true
+            probeGpuOnceAndCache()
+        }
+
+        // 1) 优先用探测到的 busy 路径直接读
+        cachedGpuBusyPath?.let { path ->
             try {
-                val v = java.io.File("/sys/class/power_supply/battery/$name").readText().trim().toFloatOrNull() ?: continue
+                val f = java.io.File(path)
+                if (f.exists()) {
+                    // 针对 pvr/status 的多行解析（这条路径是文本）
+                    val raw = f.readText()
+                    if (path.contains("pvr/status")) {
+                        for (l in raw.lineSequence()) {
+                            val m = Regex("""utilization[:\s]*(\d+(\.\d+)?)""").find(l.lowercase()) ?: continue
+                            return (m.groupValues[1].toFloatOrNull() ?: continue).coerceIn(0f, 100f)
+                        }
+                    }
+                    // 针对 mtk_gpufreq/*.key=value 文本
+                    if (path.contains("mtk_gpufreq")) {
+                        for (l in raw.lineSequence()) {
+                            val lower = l.lowercase()
+                            if (lower.contains("busy") || lower.contains("percent") || lower.contains("util")) {
+                                val num = Regex("""(\d+(\.\d+)?)""").find(l)?.groupValues?.getOrNull(1)?.toFloatOrNull() ?: continue
+                                if (num in 0f..100f) return num
+                                if (num > 100f) return (num / 10f).coerceIn(0f, 100f)
+                            }
+                        }
+                    }
+                    val v = tryParsePercentFromString(raw)
+                    if (v != null) return v
+                } else {
+                    // 路径失效（例如热更新/重启），下次重新探测
+                    cachedGpuBusyPath = null
+                    gpuProbeDone = false
+                }
+            } catch (_: Throwable) { cachedGpuBusyPath = null; gpuProbeDone = false }
+        }
+
+        // 2) 没探测到 busy 路径：用 cur_freq 做基于最大频率的线性"估算负载"
+        // 注意：这仍然是估算，但至少用的是真实硬件频率，不是我拍脑袋写的假数字；
+        //       如果连 cur_freq 都探测不到，就直接返回 -1f（显示--），绝不造假。
+        cachedGpuFreqPath?.let { path ->
+            try {
+                val f = java.io.File(path)
+                if (!f.exists()) { cachedGpuFreqPath = null; gpuProbeDone = false; return@let }
+                val text = f.readText()
+                // mtk_gpufreq 的 key=value
+                if (path.contains("mtk_gpufreq")) {
+                    for (l in text.lineSequence()) {
+                        val lower = l.lowercase()
+                        if (lower.contains("freq") || lower.contains("cur") || lower.contains("current")) {
+                            val m = Regex("""=\s*(\d+)""").find(l) ?: continue
+                            val raw = m.groupValues[1].toIntOrNull() ?: continue
+                            val khz = raw
+                            val mhz = if (khz > 1_000_000) khz / 1_000_000 else khz / 1_000
+                            if (mhz <= 0) continue
+                            // 芯片页截图 500MHz~2500MHz，取 1800 作为最大（用户实际 PowerVR BXM-8-256 降频版）
+                            return ((mhz.toFloat() / 1800f) * 100f).coerceIn(0f, 100f)
+                        }
+                    }
+                }
+                val mhz = tryParseFreqToMhz(text) ?: return@let
+                return ((mhz / 1800f) * 100f).coerceIn(0f, 100f)
+            } catch (_: Throwable) { cachedGpuFreqPath = null; gpuProbeDone = false }
+        }
+        return -1f
+    }
+
+    // 温度：优先官方 BatteryManager（sticky）API → 这是你"设备信息"App 概览页 43.5℃
+    // 的真实来源，**不需要任何权限**，所有 Android 版本都稳定。
+    // 只有当 BatteryManager 真的读不到时，才会再去试 sysfs 节点（且返回值仍要判定有效，否则 -1f 显示--）
+    private fun readTemperature(): Float {
+        // 1) 官方 BatteryManager（第一优先级，绝不会是假数据）
+        val bat = readBatteryTemperatureOfficial()
+        if (bat >= 0f && bat in 0f..100f) return bat
+
+        // 2) /sys/class/power_supply/battery/temp 兜底（有些ROM BatteryManager 被魔改，但 sysfs 仍有效）
+        for (name in listOf("temp", "temperature", "battery_temp")) {
+            try {
+                val v = java.io.File("/sys/class/power_supply/battery/$name")
+                    .readText().trim().toFloatOrNull() ?: continue
                 if (v <= 0f) continue
                 val c = if (v > 200f) v / 10f else v
                 if (c in 0f..100f) return c
             } catch (_: Throwable) {}
         }
-        // 3) thermal_zone：找 cpu / gpu / soc / mtkts* / mtkt* / tsens 等
+
+        // 3) thermal_zone：明确按类型匹配
         val wantTypes = listOf("cpu", "gpu", "soc", "tsens", "mtkts", "mtkt", "pm8998_tz", "ncp", "tzn", "tmep")
         for (i in 0 until 30) {
-            val tp = "/sys/class/thermal/thermal_zone$i/temp"
-            val ty = "/sys/class/thermal/thermal_zone$i/type"
             try {
-                val type = java.io.File(ty).readText().trim().lowercase()
-                if (wantTypes.any { type.contains(it) }) {
-                    val raw = java.io.File(tp).readText().trim().toFloatOrNull() ?: continue
-                    val c = if (raw > 1000f) raw / 1000f else raw
-                    if (c in 0f..100f) return c
-                }
-            } catch (_: Throwable) {}
-        }
-        // 4) 最后兜底：前6个thermal_zone随便拿一个非0
-        for (i in 0 until 10) {
-            try {
+                val type = java.io.File("/sys/class/thermal/thermal_zone$i/type")
+                    .readText().trim().lowercase()
+                if (!wantTypes.any { type.contains(it) }) continue
                 val raw = java.io.File("/sys/class/thermal/thermal_zone$i/temp")
                     .readText().trim().toFloatOrNull() ?: continue
                 val c = if (raw > 1000f) raw / 1000f else raw
                 if (c in 0f..100f) return c
             } catch (_: Throwable) {}
         }
-        return 0f
+        return -1f
     }
 
     /**
@@ -359,9 +491,11 @@ class LightweightMetricsPoller(
         } catch (_: Throwable) { -1 }
     }
 
+    // 实体估算：只有当 GPU / FPS 真的都读到了才估算；任何一项未知都 -1 → UI 显示--
     private fun estimateEntity(gpu: Float, fps: Int): Int {
+        if (gpu < 0f || fps < 0) return -1
         val loadF = (gpu / 100f).coerceIn(0f, 1f)
-        val fpsF = if (fps < 0) 0.3f else (max(0f, (60f - fps) / 60f))
+        val fpsF = (max(0f, (60f - fps) / 60f))
         val s = loadF * 0.7f + fpsF * 0.3f
         return (s * s * 200f).toInt().coerceIn(0, 180)
     }
