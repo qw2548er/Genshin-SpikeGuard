@@ -15,6 +15,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.spikeguard.R
 import com.spikeguard.core.ConfigManager
+import com.spikeguard.core.LightweightMetricsPoller
 import com.spikeguard.core.PermissionMode
 import com.spikeguard.core.RunMode
 import com.spikeguard.core.UiStateBridge
@@ -66,6 +67,11 @@ class MainActivity : AppCompatActivity() {
     // 跨进程广播接收器
     private lateinit var uiStateReceiver: BroadcastReceiver
 
+    // 主进程本地轻量轮询器（服务没启动时使用）
+    private var localPoller: LightweightMetricsPoller? = null
+    // 是否显示过任何真实数据（用来避免第一次采样前UI显示0）
+    private var metricsSeen = false
+
     companion object {
         private const val REQUEST_CODE_IMPORT_CONFIG = 1001
         private const val REQUEST_CODE_OVERLAY = 1002
@@ -93,6 +99,15 @@ class MainActivity : AppCompatActivity() {
 
         // 注册跨进程广播接收器（接收来自:guard服务进程的UI状态更新）
         registerUiStateReceiver()
+
+        // 界面一打开，先初始化占位（后续 localPoller 或广播会覆盖）
+        updateMetricsUi(fps = -1, gpuLoad = -1f, cpuLoad = -1f, temperature = -1f, entityEstimate = -1)
+
+        // 检查服务状态，如果没启动则启动本地轮询采集（核心：即使"已停止"也有实时性能数据）
+        checkServiceStatus()
+        if (!serviceRunning) {
+            startLocalPoller()
+        }
     }
 
     private fun initViews() {
@@ -220,6 +235,8 @@ class MainActivity : AppCompatActivity() {
                                 tvStatus.setTextColor(getColor(R.color.monitoring))
                                 btnStart.isEnabled = false
                                 btnStop.isEnabled = true
+                                // 守护服务起来了 → 停掉本地 poller，避免双重采样
+                                stopLocalPoller()
                             }
                             "stopped" -> {
                                 serviceRunning = false
@@ -227,6 +244,8 @@ class MainActivity : AppCompatActivity() {
                                 tvStatus.setTextColor(getColor(R.color.stopped))
                                 btnStart.isEnabled = true
                                 btnStop.isEnabled = false
+                                // 服务停了 → 重新启动本地 poller 保证实时数据仍显示
+                                startLocalPoller()
                             }
                         }
                     }
@@ -257,57 +276,143 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 从Bundle更新UI状态
+     * 从Bundle更新UI状态（来自 :guard 进程的广播）
      */
     private fun updateUiStateFromBundle(extras: Bundle) {
-        val fps = extras.getInt("fps", 0)
-        val gpuLoad = extras.getFloat("gpu_load", 0f)
-        val cpuLoad = extras.getFloat("cpu_load", 0f)
-        val temperature = extras.getFloat("temperature", 0f)
-        val entityEstimate = extras.getInt("entity_estimate", 0)
+        // 只要收到广播数据，一定认为这是"真实数据"（不管字段是0还是多少）
+        metricsSeen = true
+
+        val fps = extras.getInt("fps", -1).let { if (it <= 0 && !extras.containsKey("fps")) -1 else it }
+        val gpuLoad = extras.getFloat("gpu_load", -1f)
+        val cpuLoad = extras.getFloat("cpu_load", -1f)
+        val temperature = extras.getFloat("temperature", -1f)
+        val entityEstimate = extras.getInt("entity_estimate", -1)
         val protectionsToday = extras.getInt("protections_today", 0)
-        val riskLevel = extras.getString("risk_level", "LOW")
+        val riskLevel = extras.getString("risk_level", "LOW") ?: "LOW"
         val silentMode = extras.getBoolean("silent_mode", false)
 
-        tvFps.text = "$fps FPS"
-        tvGpuLoad.text = "GPU: ${"%.1f".format(gpuLoad)}%"
-        tvCpuLoad.text = "CPU: ${"%.1f".format(cpuLoad)}%"
-        tvTemperature.text = "温度: ${"%.1f".format(temperature)}°C"
-        tvEntityEstimate.text = "估算实体: ~$entityEstimate"
+        updateMetricsUi(fps, gpuLoad, cpuLoad, temperature, entityEstimate)
+
         tvProtections.text = "今日保护: $protectionsToday 次"
         tvRiskLevel.text = "风险等级: $riskLevel"
-
-        // 帧率颜色
-        tvFps.setTextColor(
-            when {
-                fps >= 50 -> getColor(R.color.good)
-                fps >= 30 -> getColor(R.color.warning)
-                else -> getColor(R.color.danger)
-            }
-        )
-
-        // GPU 负载颜色
-        tvGpuLoad.setTextColor(
-            when {
-                gpuLoad < 60 -> getColor(R.color.good)
-                gpuLoad < 85 -> getColor(R.color.warning)
-                else -> getColor(R.color.danger)
-            }
-        )
-
-        // CPU 负载颜色
-        tvCpuLoad.setTextColor(
-            when {
-                cpuLoad < 60 -> getColor(R.color.good)
-                cpuLoad < 85 -> getColor(R.color.warning)
-                else -> getColor(R.color.danger)
-            }
-        )
 
         // 静默模式状态
         if (silentMode) {
             tvStatus.text = "静默中 - 原神启动保护"
             tvStatus.setTextColor(getColor(R.color.warning))
+        }
+    }
+
+    // ============== 本地轻量轮询 ==============
+
+    private fun startLocalPoller() {
+        if (localPoller != null) return
+        val poller = LightweightMetricsPoller(this) { snap ->
+            metricsSeen = true
+            updateMetricsUi(snap.fps, snap.gpuLoad, snap.cpuLoad, snap.temperature, snap.entityEstimate)
+        }
+        localPoller = poller
+        poller.start()
+    }
+
+    private fun stopLocalPoller() {
+        try {
+            localPoller?.stop()
+        } catch (_: Throwable) {}
+        localPoller = null
+    }
+
+    /**
+     * 统一更新 6 个实时性能字段（无论数据源是本地 poller 还是服务广播）
+     *
+     * 参数约定：值为 -1 / -1f 代表暂时没有数据，显示 "--"
+     * 任何 >=0 的值都认为是真实值，不做占位隐藏
+     */
+    private fun updateMetricsUi(
+        fps: Int,
+        gpuLoad: Float,
+        cpuLoad: Float,
+        temperature: Float,
+        entityEstimate: Int
+    ) {
+        val unknown = getColor(R.color.text_secondary)
+        val good = getColor(R.color.good)
+        val warning = getColor(R.color.warning)
+        val danger = getColor(R.color.danger)
+
+        // ---- FPS ----
+        if (fps < 0) {
+            tvFps.text = "-- FPS"
+            tvFps.setTextColor(unknown)
+        } else {
+            tvFps.text = "$fps FPS"
+            tvFps.setTextColor(
+                when {
+                    fps >= 50 -> good
+                    fps >= 30 -> warning
+                    else -> danger
+                }
+            )
+        }
+
+        // ---- GPU ----
+        if (gpuLoad < 0f) {
+            tvGpuLoad.text = "GPU: --%"
+            tvGpuLoad.setTextColor(unknown)
+        } else {
+            tvGpuLoad.text = "GPU: ${"%.1f".format(gpuLoad)}%"
+            tvGpuLoad.setTextColor(
+                when {
+                    gpuLoad < 60 -> good
+                    gpuLoad < 85 -> warning
+                    else -> danger
+                }
+            )
+        }
+
+        // ---- CPU ----
+        if (cpuLoad < 0f) {
+            tvCpuLoad.text = "CPU: --%"
+            tvCpuLoad.setTextColor(unknown)
+        } else {
+            tvCpuLoad.text = "CPU: ${"%.1f".format(cpuLoad)}%"
+            tvCpuLoad.setTextColor(
+                when {
+                    cpuLoad < 60 -> good
+                    cpuLoad < 85 -> warning
+                    else -> danger
+                }
+            )
+        }
+
+        // ---- Temperature ----
+        if (temperature < 0f) {
+            tvTemperature.text = "温度: --°C"
+            tvTemperature.setTextColor(unknown)
+        } else {
+            tvTemperature.text = "温度: ${"%.1f".format(temperature)}°C"
+            tvTemperature.setTextColor(
+                when {
+                    temperature < 45 -> good
+                    temperature < 60 -> warning
+                    else -> danger
+                }
+            )
+        }
+
+        // ---- Entity ----
+        if (entityEstimate < 0) {
+            tvEntityEstimate.text = "估算实体: --"
+            tvEntityEstimate.setTextColor(unknown)
+        } else {
+            tvEntityEstimate.text = "估算实体: ~$entityEstimate"
+            tvEntityEstimate.setTextColor(
+                when {
+                    entityEstimate < 30 -> good
+                    entityEstimate < 80 -> warning
+                    else -> danger
+                }
+            )
         }
     }
 
@@ -405,8 +510,12 @@ class MainActivity : AppCompatActivity() {
             tvStatus.text = "启动中..."
             btnStart.isEnabled = false
             btnStop.isEnabled = true
+            // 既然准备让服务接管数据了，本地先停掉（避免双重耗电）
+            stopLocalPoller()
         } catch (e: Exception) {
             tvStatus.text = "启动失败: ${e.message}"
+            // 失败就把本地采样重新拉回来
+            startLocalPoller()
         }
     }
 
@@ -424,6 +533,8 @@ class MainActivity : AppCompatActivity() {
             tvStatus.setTextColor(getColor(R.color.stopped))
             btnStart.isEnabled = true
             btnStop.isEnabled = false
+            // 服务停了，UI 实时数据不应该停 —— 启动本地轮询
+            startLocalPoller()
         } catch (e: Exception) {
             tvStatus.text = "停止失败: ${e.message}"
         }
@@ -655,12 +766,26 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 检查服务是否在运行并更新UI状态
+        // 检查服务是否在运行并更新UI状态；如果没启动则启动本地 poller
         checkServiceStatus()
+        if (!serviceRunning) {
+            startLocalPoller()
+        } else {
+            stopLocalPoller()
+        }
+    }
+
+    override fun onPause() {
+        // 离开页面时停掉本地轮询，省 CPU
+        if (!serviceRunning) {
+            stopLocalPoller()
+        }
+        super.onPause()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        stopLocalPoller()
         // 注销广播接收器
         try {
             unregisterReceiver(uiStateReceiver)

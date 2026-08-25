@@ -32,10 +32,29 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
     private var lastCpuIdle = 0L
     private var cpuLoadInitialized = false
 
-    // FPS相关
-    private var currentFps = 60
-    private var frameSampleCount = 0
+    // FPS相关 - 真实SurfaceFlinger读取
+    private var realFpsValue = -1  // -1 表示尚未获取到真实值
     private var lastFpsSampleTime = 0L
+    private var lastFpsWindowStart = 0L
+    private var lastFrameCountTotal = -1L
+
+    // FPS命令尝试顺序（不同Android版本可用的不同）
+    private val surfaceFlingerFpsCommands = listOf(
+        "dumpsys SurfaceFlinger --latency 'SurfaceView - com.miHoYo.Yuanshen/com.miHoYo.Yuanshen/com.miHoYo.ys.YsNativeActivity'",
+        "dumpsys SurfaceFlinger --latency 'SurfaceView - com.miHoYo.GenshinImpact/com.miHoYo.GenshinImpact/com.miHoYo.ys.YsNativeActivity'",
+        "dumpsys SurfaceFlinger --latency 'SurfaceView - com.mihoyo.genshinimpact/com.mihoyo.genshinimpact/com.miHoYo.ys.YsNativeActivity'",
+        // 任意 SurfaceView
+        "dumpsys SurfaceFlinger --latency-clear 2>/dev/null; dumpsys SurfaceFlinger --latency 'DEFAULT_DISPLAY' 2>/dev/null | tail -100",
+        // 简化通用方案：统计指定1s周期内提交的帧数（直接数行数）
+        "dumpsys SurfaceFlinger --latency 2>/dev/null"
+    )
+
+    // 备用方案：dumpsys gfxinfo 读总帧数增量
+    private val gfxInfoPackages = listOf(
+        "com.miHoYo.Yuanshen",
+        "com.miHoYo.GenshinImpact",
+        "com.mihoyo.genshinimpact"
+    )
 
     // 尖峰检测相关
     private val gpuLoadHistory = ArrayDeque<Float>()
@@ -425,73 +444,175 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
     // ========== FPS 计算 ==========
 
     /**
-     * 计算FPS
+     * 真实 FPS 计算（绝不造假）
      *
-     * 由于后台服务无法直接访问Choreographer，采用以下策略：
-     * 1. 优先尝试读取SurfaceFlinger的帧统计（root/shizuku）
-     * 2. 回退到基于GPU负载的估算
+     * 策略（优先级从高到低）：
+     *  1. dumpsys SurfaceFlinger --latency <layer>  — 直接数帧，最准（后台 Android S+ 都允许）
+     *  2. dumpsys gfxinfo <pkg> framecounter  — 读"Total frames rendered"增量 ÷ 窗口秒
+     *  3. SurfaceFlinger --latency 通用行数统计
+     *  4. **作为最后的 fallback**：基于 GPU/CPU 负载的近似估算（完全平滑，不做随机波动）
      *
-     * 注意：这是近似值，不是精确的帧率
+     *  采样窗口：至少 1s 才计算一次，避免抖动
      */
     private fun calculateFps(): Int {
-        frameSampleCount++
-
-        // 每秒更新一次估算
         val now = System.currentTimeMillis()
-        if (now - lastFpsSampleTime > 1000) {
-            lastFpsSampleTime = now
-            frameSampleCount = 0
+        val windowMs = 1000L
 
-            // 基于GPU负载估算FPS
-            // 高GPU负载 + 高CPU = 低FPS
-            val gpuLoad = gpuLoadHistory.lastOrNull() ?: 30f
-            val baseFps = 60f
-            val loadFactor = gpuLoad / 100f
+        // 1秒内不重算，直接返回上一次真实值
+        if (now - lastFpsSampleTime < windowMs) {
+            return if (realFpsValue > 0) realFpsValue else fallbackFpsEstimate()
+        }
+        lastFpsSampleTime = now
 
-            // 非线性估算：负载越高掉帧越严重
-            val estimatedFps = when {
-                loadFactor < 0.3f -> 60
-                loadFactor < 0.5f -> 55
-                loadFactor < 0.6f -> 45
-                loadFactor < 0.7f -> 35
-                loadFactor < 0.8f -> 25
-                loadFactor < 0.9f -> 18
-                else -> 10
-            }
-
-            // 加入一些随机波动使其看起来更真实（±3fps）
-            val jitter = ((Math.random() * 6) - 3).toInt()
-            currentFps = (estimatedFps + jitter).coerceIn(5, 60)
+        // ===== 方案 1&3：SurfaceFlinger --latency 行数统计 =====
+        val sfFps = runCommandForIntFps("dumpsys SurfaceFlinger --latency 2>&1")
+        if (sfFps > 0) {
+            realFpsValue = sfFps
+            return sfFps
         }
 
-        return currentFps
+        // ===== 原神 Layer 精确版 =====
+        for (cmd in surfaceFlingerFpsCommands) {
+            val v = runCommandForIntFps(cmd)
+            if (v > 0) {
+                realFpsValue = v
+                return v
+            }
+        }
+
+        // ===== 方案 2：dumpsys gfxinfo Total frames rendered 增量 =====
+        for (pkg in gfxInfoPackages) {
+            val v = gfxInfoFpsByPackage(pkg, now)
+            if (v > 0) {
+                realFpsValue = v
+                return v
+            }
+        }
+
+        // ===== 最后才使用 fallback 估算（零随机，基于负载）=====
+        val fallback = fallbackFpsEstimate()
+        if (realFpsValue < 0) realFpsValue = fallback
+        return fallback
+    }
+
+    /**
+     * 纯负载估算（不造假、不做随机波动）
+     * 只在所有真实命令失败时使用
+     */
+    private fun fallbackFpsEstimate(): Int {
+        val recentGpu = gpuLoadHistory.takeLast(3).average().let { if (it.isNaN()) 30f else it.toFloat() }
+        val cpuNow = readCpuLoadCached()
+        val combined = recentGpu * 0.65f + cpuNow * 0.35f
+        return when {
+            combined < 25f -> 60
+            combined < 40f -> 58
+            combined < 50f -> 55
+            combined < 60f -> 48
+            combined < 70f -> 40
+            combined < 80f -> 30
+            combined < 90f -> 22
+            else -> 14
+        }
+    }
+
+    // 最近一次 CPU 缓存（避免 1 秒内双重采样）
+    private var cachedCpuAt = 0L
+    private var cachedCpu = 0f
+    private fun readCpuLoadCached(): Float {
+        val now = System.currentTimeMillis()
+        if (now - cachedCpuAt < 300L) return cachedCpu
+        cachedCpuAt = now
+        cachedCpu = readCpuLoad()
+        return cachedCpu
+    }
+
+    /**
+     * 解析 dumpsys SurfaceFlinger --latency 输出：
+     *  - 格式：每行是 v1, v2, v3（3个时间戳）代表一个真实提交的帧
+     *  - 我们只数 3 个数字的有效行数
+     *  - 通过前后两次调用之间的行数差 ÷ 时间差秒数 得到 FPS
+     */
+    private var lastLatencyLineCount = -1
+    private var lastLatencySampleTime = 0L
+
+    private fun runCommandForIntFps(cmd: String): Int {
+        return try {
+            val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
+            proc.waitFor(1500L, java.util.concurrent.TimeUnit.MILLISECONDS)
+            val lines = proc.inputStream.bufferedReader().useLines { it.toList() }
+            // 只取 3 个数字列的有效帧行
+            val valid = lines.count { l ->
+                val p = l.trim().split("\\s+".toRegex()).filter { it.isNotEmpty() }
+                p.size == 3 && p.all { it.toLongOrNull() != null }
+            }
+            proc.destroy()
+            val now = System.currentTimeMillis()
+            return if (lastLatencyLineCount < 0) {
+                lastLatencyLineCount = valid
+                lastLatencySampleTime = now
+                -1
+            } else {
+                val lineDiff = (valid - lastLatencyLineCount).coerceAtLeast(0)
+                val dt = (now - lastLatencySampleTime).coerceAtLeast(1)
+                lastLatencyLineCount = valid
+                lastLatencySampleTime = now
+                if (dt >= 400L) ((lineDiff * 1000f) / dt).toInt().coerceIn(0, 120) else -1
+            }
+        } catch (_: Throwable) {
+            -1
+        }
+    }
+
+    /**
+     * 通过 gfxinfo 的 "Total frames rendered:" 增量算FPS
+     */
+    private fun gfxInfoFpsByPackage(pkg: String, nowMs: Long): Int {
+        return try {
+            val proc = Runtime.getRuntime().exec(
+                arrayOf("sh", "-c", "dumpsys gfxinfo $pkg 2>/dev/null | grep -E 'Total frames rendered|Janky frames'")
+            )
+            proc.waitFor(1500L, java.util.concurrent.TimeUnit.MILLISECONDS)
+            val out = proc.inputStream.bufferedReader().readText()
+            proc.destroy()
+            val total = Regex("Total frames rendered:\\s*(\\d+)").find(out)?.groupValues?.get(1)?.toLongOrNull()
+                ?: return -1
+            if (lastFrameCountTotal < 0 || lastFpsWindowStart == 0L) {
+                lastFrameCountTotal = total
+                lastFpsWindowStart = nowMs
+                return -1
+            }
+            val df = total - lastFrameCountTotal
+            val dt = (nowMs - lastFpsWindowStart).coerceAtLeast(1)
+            lastFrameCountTotal = total
+            lastFpsWindowStart = nowMs
+            if (dt < 600L || df < 0) return -1
+            ((df * 1000f) / dt).toInt().coerceIn(0, 120)
+        } catch (_: Throwable) {
+            -1
+        }
     }
 
     // ========== 实体数量估算 ==========
 
     /**
-     * 估算实体数量
-     * 通过GPU负载和帧率反推场景复杂度
+     * 估算实体数量 - 不做随机波动，只用稳定的比例模型
      *
      * 模型逻辑：
      * - GPU负载越高，实体越多
      * - FPS越低，实体越多
-     * - 两者组合得到估算值
+     * - 两者组合得到估算值（0~150范围）
      */
     private fun estimateEntityCount(gpuLoad: Float, fps: Int): Int {
         // 高GPU + 低FPS = 大量实体
-        val loadFactor = gpuLoad / 100f  // 0~1
-        val fpsFactor = max(0f, (60f - fps) / 60f) // 0~1
+        val loadFactor = (gpuLoad / 100f).coerceIn(0f, 1f)
+        val fpsFactor = max(0f, (60f - fps) / 60f)
 
-        // 加权计算
-        val combinedScore = loadFactor * 0.6f + fpsFactor * 0.4f
+        // 加权计算（GPU主导，因为 GPU 负载是真数据）
+        val combinedScore = loadFactor * 0.7f + fpsFactor * 0.3f
 
-        // 映射到实体数量（0~150范围）
-        val estimate = (combinedScore * combinedScore * 180).toInt()
-
-        // 添加轻微波动
-        val jitter = (Math.random() * 10 - 5).toInt()
-        return max(0, estimate + jitter)
+        // 映射到实体数量（0~150范围），用曲线让战斗区间更敏感
+        val estimate = (combinedScore * combinedScore * 200f).toInt()
+        return estimate.coerceIn(0, 180)
     }
 
     companion object {
