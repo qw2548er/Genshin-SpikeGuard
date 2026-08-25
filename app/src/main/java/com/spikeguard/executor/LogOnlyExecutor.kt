@@ -14,6 +14,10 @@ class LogOnlyExecutor : ActionExecutor {
 
     private var initialized = false
 
+    override fun getDetailedStatus(): ShizukuDetailedStatus = ShizukuDetailedStatus.BINDER_OK
+
+    override fun getStatusHumanMessage(): String = "📝 纯日志模式（不执行任何实际系统修改，仅记录保护事件）"
+
     override fun isAvailable(): Boolean = true
 
     override fun initialize(): Boolean {
@@ -74,6 +78,28 @@ class LogOnlyExecutor : ActionExecutor {
             true,
             "Log only: All reset"
         )
+    }
+
+    override fun executeFullProtectionFlow(
+        reclaimMemory: Boolean,
+        gpuThrottle: Float,
+        cpuThrottle: Float,
+        boostPriority: Boolean,
+        targetPackageName: String,
+        durationMs: Long
+    ): FullFlowResult {
+        val t0 = System.currentTimeMillis()
+        val r1 = if (reclaimMemory) reclaimMemory() else null
+        val r2 = setGpuThrottle(gpuThrottle)
+        val r3 = setCpuThrottle(cpuThrottle)
+        val r4 = if (boostPriority) boostProcessPriority(targetPackageName) else null
+        try { Thread.sleep(durationMs.coerceAtLeast(50L)) } catch (_: Throwable) {}
+        val r5 = resetAll()
+        val total = System.currentTimeMillis() - t0
+        val list = listOfNotNull(r1, r2, r3, r4, r5)
+        val ok = list.count { it.success }
+        Log.i(TAG, "[LOG ONLY] Full flow done: success=$ok/${list.size}, total=${total}ms")
+        return FullFlowResult(r1, r2, r3, r4, r5, total, ok, list.size)
     }
 
     override fun release() {

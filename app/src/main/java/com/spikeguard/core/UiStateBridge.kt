@@ -65,6 +65,16 @@ class UiStateBridge(private val context: Context) {
             broadcastModeEvent(event.data)
         }
 
+        // ===== P1-3 新增：转发场景变化（DecisionEngine发布的SCENE_CHANGED）=====
+        bus.subscribe(EventType.SCENE_CHANGED) { event ->
+            broadcastSceneEvent(event.data)
+        }
+
+        // ===== P1-3 新增：转发测试保护结果 =====
+        bus.subscribe(EventType.TEST_PROTECTION_RESULT) { event ->
+            broadcastTestProtectionResult(event.data)
+        }
+
         Log.i(TAG, "UiStateBridge started - cross-process broadcast enabled")
     }
 
@@ -198,6 +208,50 @@ class UiStateBridge(private val context: Context) {
         }
     }
 
+    /**
+     * P1-3: 广播场景变化（DecisionEngine发布的SCENE_CHANGED）
+     * 主界面用来显示"当前场景：大世界/副本/枪限挑战/千星奇域"
+     */
+    private fun broadcastSceneEvent(data: Map<String, Any>) {
+        try {
+            val intent = Intent(ACTION_SCENE_EVENT).apply {
+                setPackage(context.packageName)
+                data.forEach { (key, value) ->
+                    when (value) {
+                        is String -> putExtra(key, value)
+                        is Int -> putExtra(key, value)
+                        is Boolean -> putExtra(key, value)
+                    }
+                }
+            }
+            context.sendBroadcast(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to broadcast scene event", e)
+        }
+    }
+
+    /**
+     * P1-3: 广播测试保护执行结果
+     */
+    private fun broadcastTestProtectionResult(data: Map<String, Any>) {
+        try {
+            val intent = Intent(ACTION_TEST_PROTECTION_RESULT).apply {
+                setPackage(context.packageName)
+                data.forEach { (key, value) ->
+                    when (value) {
+                        is String -> putExtra(key, value)
+                        is Int -> putExtra(key, value)
+                        is Long -> putExtra(key, value)
+                        is Boolean -> putExtra(key, value)
+                    }
+                }
+            }
+            context.sendBroadcast(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to broadcast test protection result", e)
+        }
+    }
+
     companion object {
         private const val TAG = "UiStateBridge"
 
@@ -206,5 +260,7 @@ class UiStateBridge(private val context: Context) {
         const val ACTION_PROTECTION_EVENT = "com.spikeguard.action.PROTECTION_EVENT"
         const val ACTION_SILENT_MODE_CHANGED = "com.spikeguard.action.SILENT_MODE_CHANGED"
         const val ACTION_MODE_CHANGED = "com.spikeguard.action.MODE_CHANGED"
+        const val ACTION_SCENE_EVENT = "com.spikeguard.action.SCENE_EVENT"
+        const val ACTION_TEST_PROTECTION_RESULT = "com.spikeguard.action.TEST_PROTECTION_RESULT"
     }
 }

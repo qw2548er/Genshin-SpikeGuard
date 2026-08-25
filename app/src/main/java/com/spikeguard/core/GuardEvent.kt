@@ -20,6 +20,8 @@ enum class EventType {
     ACTION_EXECUTED,          // 动作已执行
     ACTION_FAILED,            // 动作执行失败
     MODE_CHANGED,             // 运行模式变化
+    TEST_PROTECTION_REQUESTED, // UI请求一次"测试保护"
+    TEST_PROTECTION_RESULT,    // "测试保护"执行结果
 
     // 服务状态事件
     SERVICE_STARTED,          // 服务启动

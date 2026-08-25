@@ -237,6 +237,14 @@ class GuardService : Service() {
             ACTION_RESTART -> {
                 restartModules()
             }
+            // P1-3: 主界面"测试保护"按钮 → 启动服务发 ACTION_TEST_PROTECTION
+            // 在 GuardService 所在进程通过 MessageBus 广播 TEST_PROTECTION_REQUESTED
+            ACTION_TEST_PROTECTION -> {
+                Log.i(TAG, "Received TEST_PROTECTION action, publishing via MessageBus")
+                bus.publish(EventType.TEST_PROTECTION_REQUESTED,
+                    "manual" to true,
+                    "requester" to "main_activity")
+            }
         }
 
         return START_STICKY
@@ -428,5 +436,7 @@ class GuardService : Service() {
         const val ACTION_START = "com.spikeguard.action.START"
         const val ACTION_STOP = "com.spikeguard.action.STOP"
         const val ACTION_RESTART = "com.spikeguard.action.RESTART"
+        // P1-3: 手动触发一次完整保护流程（供测试按钮使用）
+        const val ACTION_TEST_PROTECTION = "com.spikeguard.action.TEST_PROTECTION"
     }
 }

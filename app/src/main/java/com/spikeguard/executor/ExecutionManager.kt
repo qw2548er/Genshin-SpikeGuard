@@ -63,6 +63,20 @@ class ExecutionManager(
                 onModeChanged(event)
             }
         }
+        // 订阅"测试保护"指令（来自UI的手动触发）
+        bus.subscribe(EventType.TEST_PROTECTION_REQUESTED) { event ->
+            executorHandler?.post {
+                val result = executeTestProtection()
+                bus.publish(
+                    EventType.TEST_PROTECTION_RESULT,
+                    "any_success" to result.anySuccess,
+                    "success_count" to result.successCount,
+                    "attempted_count" to result.attemptedCount,
+                    "total_ms" to result.totalMs,
+                    "executor" to (currentExecutor?.name ?: "none")
+                )
+            }
+        }
     }
 
     /**
@@ -227,17 +241,16 @@ class ExecutionManager(
     /**
      * 保护触发处理（在后台线程调用）
      *
-     * 完整保护流程：
-     * 1. 回收空闲内存
-     * 2. GPU钳制
-     * 3. CPU钳制
-     * 4. 提升进程优先级
-     * 5. 帧率限制（可选）
+     * 核心改动（P1-2c）：统一调用 executor.executeFullProtectionFlow()
+     * 由执行器内部完成：内存回收→GPU钳制→CPU钳制→优先级提升→等待1500ms→无条件resetAll
+     * 不再在这里分开5步调用+渐变恢复，避免"恢复延迟"和"钳制泄漏"
      */
     private fun onProtectionTriggered(event: GuardEvent) {
-        val executor = currentExecutor ?: return
+        val executor = currentExecutor ?: run {
+            android.util.Log.w(TAG, "onProtectionTriggered: no executor available")
+            return
+        }
 
-        // 暂停状态下不执行保护
         if (isPaused) {
             android.util.Log.w(TAG, "Protection skipped: paused (silent mode)")
             return
@@ -246,79 +259,115 @@ class ExecutionManager(
         val sceneId = event.data["scene_id"] as? String ?: "unknown"
         val sceneName = event.data["scene_name"] as? String ?: "未知场景"
         val cpuThrottle = event.data["cpu_throttle"] as? Float ?: 0.7f
-        val gpuThrottle = event.data["gpu_throttle"] as? Float ?: 0.6f
-        val frameLimit = event.data["frame_limit"] as? Int ?: 30
+        val gpuThrottle = event.data["gpu_throttle"] as? Float ?: 0.55f
         val reclaimMemory = event.data["reclaim_memory"] as? Boolean ?: true
         val boostPriority = event.data["boost_priority"] as? Boolean ?: true
+        val durationMs = event.data["duration_ms"] as? Long ?: 1500L
         val logOnly = event.data["log_only"] as? Boolean ?: false
+        val unconditionalRestore = event.data["unconditional_restore"] as? Boolean ?: true
 
         android.util.Log.i(TAG,
-            "Executing protection: scene=$sceneName, " +
+            "Executing FULL FLOW protection: scene=$sceneName, " +
                     "reclaim_mem=$reclaimMemory, " +
                     "gpu=${(gpuThrottle * 100).toInt()}%, " +
                     "cpu=${(cpuThrottle * 100).toInt()}%, " +
                     "boost_priority=$boostPriority, " +
+                    "duration=${durationMs}ms, " +
                     "log_only=$logOnly")
 
-        // 如果是log_only模式，直接记录日志，不调用执行器
-        if (logOnly || executor is LogOnlyExecutor) {
-            android.util.Log.i(TAG, "[LOG ONLY] Protection would be triggered for $sceneName")
-            bus.publish(
-                EventType.ACTION_EXECUTED,
-                "scene_id" to sceneId,
-                "scene_name" to sceneName,
-                "log_only" to true,
-                "executor" to executor.name
+        val targetPackage = detectGenshinPackage() ?: "com.miHoYo.Yuanshen"
+
+        // log_only 或 LogOnlyExecutor 时，仍然调用 executeFullProtectionFlow（LogOnly内部不做真操作），
+        // 但也可以直接快速返回
+        val result = if (logOnly) {
+            // 纯日志快速路径：不Sleep
+            val list = listOfNotNull(
+                if (reclaimMemory) executor.reclaimMemory() else null,
+                executor.setGpuThrottle(gpuThrottle),
+                executor.setCpuThrottle(cpuThrottle),
+                if (boostPriority) executor.boostProcessPriority(targetPackage) else null,
+                executor.resetAll()
             )
-            return
-        }
-
-        // 步骤1: 回收内存
-        val memoryResult = if (reclaimMemory) {
-            safeExecute { executor.reclaimMemory() }
+            val ok = list.count { it.success }
+            FullFlowResult(list.getOrNull(0), list.getOrNull(1), list.getOrNull(2),
+                list.getOrNull(3), list.lastOrNull(), 0L, ok, list.size)
         } else {
-            ActionResult(ActionType.RECLAIM_MEMORY, true, "Skipped")
-        }
-
-        // 步骤2: GPU钳制
-        val gpuResult = safeExecute { executor.setGpuThrottle(gpuThrottle) }
-
-        // 步骤3: CPU钳制
-        val cpuResult = safeExecute { executor.setCpuThrottle(cpuThrottle) }
-
-        // 步骤4: 提升进程优先级（针对原神）
-        val priorityResult = if (boostPriority) {
-            val genshinPackage = detectGenshinPackage()
-            if (genshinPackage != null) {
-                safeExecute { executor.boostProcessPriority(genshinPackage) }
-            } else {
-                ActionResult(ActionType.BOOST_PRIORITY, false, "Genshin process not found")
+            safeExecuteFlow {
+                executor.executeFullProtectionFlow(
+                    reclaimMemory = reclaimMemory,
+                    gpuThrottle = gpuThrottle,
+                    cpuThrottle = cpuThrottle,
+                    boostPriority = boostPriority,
+                    targetPackageName = targetPackage,
+                    durationMs = durationMs
+                )
             }
-        } else {
-            ActionResult(ActionType.BOOST_PRIORITY, true, "Skipped")
         }
 
-        // 步骤5: 帧率限制
-        val frameResult = safeExecute { executor.setFrameLimit(frameLimit) }
+        // 钳制状态记录
+        currentCpuThrottle = 1f
+        currentGpuThrottle = 1f
+        targetCpuThrottle = 1f
+        targetGpuThrottle = 1f
 
-        currentCpuThrottle = cpuThrottle
-        currentGpuThrottle = gpuThrottle
-        targetCpuThrottle = cpuThrottle
-        targetGpuThrottle = gpuThrottle
+        android.util.Log.i(TAG,
+            "Full flow result: success=${result.successCount}/${result.attemptedCount}, total=${result.totalMs}ms")
 
-        // 发布执行结果
         bus.publish(
             EventType.ACTION_EXECUTED,
             "scene_id" to sceneId,
             "scene_name" to sceneName,
-            "memory_result" to memoryResult.success,
-            "gpu_result" to gpuResult.success,
-            "cpu_result" to cpuResult.success,
-            "priority_result" to priorityResult.success,
-            "frame_result" to frameResult.success,
+            "memory_result" to (result.reclaimMemory?.success ?: true),
+            "gpu_result" to (result.gpuThrottle?.success ?: true),
+            "cpu_result" to (result.cpuThrottle?.success ?: true),
+            "priority_result" to (result.boostPriority?.success ?: true),
+            "frame_result" to false,
+            "reset_result" to (result.resetAfter?.success ?: false),
             "executor" to executor.name,
-            "log_only" to false
+            "log_only" to (logOnly || executor is LogOnlyExecutor),
+            "flow_success_count" to result.successCount,
+            "flow_attempted_count" to result.attemptedCount,
+            "flow_total_ms" to result.totalMs
         )
+    }
+
+    /**
+     * 对外公开：手动触发一次"测试保护"完整流程
+     * 供UI上的"测试保护"按钮调用，使用标准/激进强度参数验证执行模块真的在干活
+     */
+    fun executeTestProtection(): FullFlowResult {
+        val executor = currentExecutor ?: return FullFlowResult(null, null, null, null, null, 0, 0, 0)
+        if (isPaused) {
+            android.util.Log.w(TAG, "Test protection skipped: paused")
+            return FullFlowResult(null, null, null, null, null, 0, 0, 0)
+        }
+
+        val targetPackage = detectGenshinPackage() ?: "com.miHoYo.Yuanshen"
+        android.util.Log.i(TAG, "TEST PROTECTION starting via ${executor.name}")
+
+        return safeExecuteFlow {
+            executor.executeFullProtectionFlow(
+                reclaimMemory = true,
+                gpuThrottle = 0.55f,       // 标准保护强度
+                cpuThrottle = 0.7f,
+                boostPriority = true,
+                targetPackageName = targetPackage,
+                durationMs = 1500L
+            )
+        }
+    }
+
+    /**
+     * 安全执行Flow（捕获所有异常）
+     */
+    private fun safeExecuteFlow(block: () -> FullFlowResult): FullFlowResult {
+        return try {
+            block()
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "Full flow exception", e)
+            val fail = ActionResult(ActionType.FULL_FLOW, false, "Exception: ${e.message}")
+            FullFlowResult(fail, fail, fail, fail, fail, 0L, 0, 1)
+        }
     }
 
     /**
@@ -334,35 +383,41 @@ class ExecutionManager(
     }
 
     /**
-     * 保护解除处理 - 带渐变恢复（在后台线程调用）
+     * 保护解除处理（P1-2c 核心改动）
+     *
+     * 关键：DecisionEngine 发布的 PROTECTION_RELEASED 事件
+     * 已经在 executeFullProtectionFlow 内部完成了 1500ms 保护 + 无条件 resetAll()
+     * 所以这里**直接跳过**，避免双重恢复或渐变恢复把刚reset掉的频率又拉错。
+     *
+     * 仅在暂停模式强制恢复时才需要手动调用 resetAll()。
      */
     private fun onProtectionReleased(event: GuardEvent) {
         val executor = currentExecutor ?: return
 
-        // 暂停状态下直接重置
+        // 只有在暂停模式（强制中断）才手动兜底 reset
         if (isPaused) {
-            android.util.Log.w(TAG, "Protection release in paused mode, resetting immediately")
+            android.util.Log.w(TAG, "Protection release in paused mode, manual reset")
             safeExecute { executor.resetAll() }
-            currentCpuThrottle = 1f
-            currentGpuThrottle = 1f
-            return
+        } else {
+            android.util.Log.i(TAG,
+                "onProtectionReleased: executor already restored inside executeFullProtectionFlow, skipping")
         }
 
-        val fadeOutMs = event.data["fade_out_ms"] as? Long ?: 3000
-
-        android.util.Log.i(TAG, "Releasing protection, fadeOut=${fadeOutMs}ms")
-
+        currentCpuThrottle = 1f
+        currentGpuThrottle = 1f
         targetCpuThrottle = 1f
         targetGpuThrottle = 1f
+    }
 
-        if (fadeOutMs <= 0) {
-            // 立即恢复
-            safeExecute { executor.resetAll() }
-            currentCpuThrottle = 1f
-            currentGpuThrottle = 1f
+    /**
+     * 获取当前执行器详细状态（用于UI的Shizuku引导提示）
+     */
+    fun getCurrentExecutorStatus(): Pair<ShizukuDetailedStatus, String> {
+        val exec = currentExecutor
+        return if (exec == null) {
+            ShizukuDetailedStatus.INITIALIZING to "⏳ 执行器尚未初始化"
         } else {
-            // 渐变恢复
-            startFadeOut(fadeOutMs)
+            exec.getDetailedStatus() to exec.getStatusHumanMessage()
         }
     }
 

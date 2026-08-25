@@ -60,6 +60,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvCpuCore6: TextView
     private lateinit var tvCpuCore7: TextView
 
+    // P1-4b: 新增控件
+    private lateinit var btnTestProtection: Button
+    private lateinit var tvScene: TextView
+    private lateinit var btnLaunchShizuku: Button
+
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
     private lateinit var switchMode: Switch
@@ -70,6 +75,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnImportConfig: Button
     private lateinit var btnExportLog: Button
     private lateinit var btnClearLog: Button
+
+    // 记录最近一次识别到的激活场景名
+    @Volatile
+    private var lastKnownSceneName: String = "待识别"
 
     private var serviceRunning = false
     private lateinit var permissionChecker: PermissionStatusChecker
@@ -141,6 +150,11 @@ class MainActivity : AppCompatActivity() {
         tvCpuCore5 = findViewById(R.id.tvCpuCore5)
         tvCpuCore6 = findViewById(R.id.tvCpuCore6)
         tvCpuCore7 = findViewById(R.id.tvCpuCore7)
+
+        // P1-4b: 新增控件
+        btnTestProtection = findViewById(R.id.btnTestProtection)
+        tvScene = findViewById(R.id.tvScene)
+        btnLaunchShizuku = findViewById(R.id.btnLaunchShizuku)
 
         btnStart = findViewById(R.id.btnStart)
         btnStop = findViewById(R.id.btnStop)
@@ -217,6 +231,19 @@ class MainActivity : AppCompatActivity() {
         btnClearLog.setOnClickListener {
             clearLogs()
         }
+
+        // P1-4b: 测试保护按钮：手动触发一次完整保护流程
+        btnTestProtection.setOnClickListener {
+            onTestProtectionClicked()
+        }
+
+        // P1-4b: Shizuku引导按钮：打开Shizuku应用或跳转市场
+        btnLaunchShizuku.setOnClickListener {
+            onLaunchShizukuClicked()
+        }
+
+        // 初始化场景显示
+        updateSceneDisplay()
     }
 
     /**
@@ -237,12 +264,15 @@ class MainActivity : AppCompatActivity() {
                         val sceneName = intent.getStringExtra("scene_name") ?: "未知"
                         when (eventType) {
                             "triggered" -> {
+                                if (sceneName.isNotEmpty()) lastKnownSceneName = sceneName
                                 tvStatus.text = "保护中 - $sceneName"
                                 tvStatus.setTextColor(getColor(R.color.protecting))
+                                updateSceneDisplay()
                             }
                             "released" -> {
                                 tvStatus.text = "监控中"
                                 tvStatus.setTextColor(getColor(R.color.monitoring))
+                                updateSceneDisplay()
                             }
                         }
                     }
@@ -276,6 +306,44 @@ class MainActivity : AppCompatActivity() {
                             tvStatus.setTextColor(getColor(R.color.warning))
                         }
                     }
+                    // P1-4b: 场景变化事件（DecisionEngine发布的SCENE_CHANGED桥接）
+                    UiStateBridge.ACTION_SCENE_EVENT -> {
+                        val sceneId = intent.getStringExtra("scene_id") ?: ""
+                        val sceneName = intent.getStringExtra("scene_name") ?: ""
+                        val active = intent.getBooleanExtra("active", false)
+                        if (active && sceneName.isNotEmpty()) {
+                            lastKnownSceneName = sceneName
+                        } else if (!active && sceneName.isNotEmpty() && lastKnownSceneName == sceneName) {
+                            // 场景失活，如果是同一个才回到"待识别"，否则保留上次识别
+                            lastKnownSceneName = sceneName
+                        }
+                        updateSceneDisplay()
+                    }
+                    // P1-4b: 测试保护执行结果
+                    UiStateBridge.ACTION_TEST_PROTECTION_RESULT -> {
+                        val anySuccess = intent.getBooleanExtra("any_success", false)
+                        val ok = intent.getIntExtra("success_count", 0)
+                        val total = intent.getIntExtra("attempted_count", 0)
+                        val ms = intent.getLongExtra("total_ms", 0L)
+                        val exec = intent.getStringExtra("executor") ?: "?"
+                        btnTestProtection.isEnabled = true
+                        btnTestProtection.text = "🧪 测试保护（完成：$ok/$total，${ms}ms · $exec）"
+                        if (anySuccess) {
+                            Toast.makeText(this@MainActivity,
+                                "✅ 测试保护执行成功（${ms}ms，${ok}/${total}步完成）",
+                                Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(this@MainActivity,
+                                "❌ 测试保护未生效，请检查Shizuku/Root授权",
+                                Toast.LENGTH_LONG).show()
+                        }
+                        // 10秒后恢复按钮默认文案
+                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                            if (!isDestroyed) {
+                                btnTestProtection.text = "🧪 测试保护（手动触发完整1500ms流程）"
+                            }
+                        }, 10_000L)
+                    }
                 }
             }
         }
@@ -286,6 +354,8 @@ class MainActivity : AppCompatActivity() {
             addAction(UiStateBridge.ACTION_SERVICE_EVENT)
             addAction(UiStateBridge.ACTION_SILENT_MODE_CHANGED)
             addAction(UiStateBridge.ACTION_MODE_CHANGED)
+            addAction(UiStateBridge.ACTION_SCENE_EVENT)
+            addAction(UiStateBridge.ACTION_TEST_PROTECTION_RESULT)
         }
         // Android 13+ 必须指定 exported 标志
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -319,6 +389,9 @@ class MainActivity : AppCompatActivity() {
 
         tvProtections.text = "今日保护: $protectionsToday 次"
         tvRiskLevel.text = "风险等级: $riskLevel"
+
+        // 每次收到采样数据都刷新场景显示（保护中状态的颜色可能变化）
+        updateSceneDisplay()
 
         // 静默模式状态
         if (silentMode) {
@@ -448,10 +521,122 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * P1-4b: 更新当前识别到的场景显示
+     * 格式：当前场景: {大世界/副本/枪限挑战/千星奇域/待识别}
+     * 保护中状态下用特殊高亮颜色
+     */
+    private fun updateSceneDisplay() {
+        if (!::tvScene.isInitialized) return
+        val status = tvStatus.text?.toString() ?: ""
+        val isProtecting = status.startsWith("保护中")
+        val prefix = if (isProtecting) "⚡ 保护中 · 当前场景: " else "当前场景: "
+        val name = when {
+            lastKnownSceneName.equals("generic", ignoreCase = true) -> "通用保护触发"
+            lastKnownSceneName.equals("battle_settlement", ignoreCase = true) -> "战斗结算"
+            lastKnownSceneName.contains("副本") || lastKnownSceneName.contains("domain", ignoreCase = true) -> "副本"
+            lastKnownSceneName.contains("枪限") || lastKnownSceneName.contains("枪限挑战") -> "枪限挑战"
+            lastKnownSceneName.contains("千星") || lastKnownSceneName.contains("奇域") -> "千星奇域"
+            lastKnownSceneName.contains("世界") || lastKnownSceneName.contains("open", ignoreCase = true) -> "大世界"
+            lastKnownSceneName.isEmpty() || lastKnownSceneName == "待识别" -> "待识别"
+            else -> lastKnownSceneName
+        }
+        tvScene.text = prefix + name
+        tvScene.setTextColor(
+            when {
+                isProtecting -> getColor(R.color.protecting)
+                lastKnownSceneName == "待识别" -> getColor(R.color.text_secondary)
+                else -> getColor(R.color.primary)
+            }
+        )
+    }
+
+    /**
+     * P1-4b: 测试保护按钮点击
+     * 发送 ACTION_TEST_PROTECTION 到 GuardService（服务进程通过MessageBus转TEST_PROTECTION_REQUESTED）
+     * 如果服务没启动，就先启动再发
+     */
+    private fun onTestProtectionClicked() {
+        btnTestProtection.isEnabled = false
+        btnTestProtection.text = "⏳ 测试保护执行中（约1500ms+恢复）..."
+        try {
+            if (!serviceRunning) {
+                // 服务没启动 → 先启动一次，稍等后再发测试指令
+                val start = Intent(this, GuardService::class.java).apply {
+                    action = GuardService.ACTION_START
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(start)
+                } else {
+                    startService(start)
+                }
+                // 服务起来需要一点时间，延迟发送测试指令
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    val testIntent = Intent(this@MainActivity, GuardService::class.java).apply {
+                        action = GuardService.ACTION_TEST_PROTECTION
+                    }
+                    startService(testIntent)
+                }, 2500L)
+            } else {
+                val testIntent = Intent(this, GuardService::class.java).apply {
+                    action = GuardService.ACTION_TEST_PROTECTION
+                }
+                startService(testIntent)
+            }
+            // 最长兜底：30000ms 超时强制恢复按钮（防止广播没收到）
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (!isDestroyed && !btnTestProtection.isEnabled) {
+                    btnTestProtection.isEnabled = true
+                    btnTestProtection.text = "🧪 测试保护（超时，请重试）"
+                }
+            }, 30_000L)
+        } catch (e: Throwable) {
+            btnTestProtection.isEnabled = true
+            btnTestProtection.text = "🧪 测试保护失败: ${e.message}"
+            Toast.makeText(this, "触发失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * P1-4b: 点击"启动Shizuku/授权应用"按钮
+     * 优先打开Shizuku应用；失败跳转系统包信息；还不行弹Toast引导去应用市场
+     */
+    private fun onLaunchShizukuClicked() {
+        val shizukuPackages = listOf(
+            "moe.shizuku.privileged.api",
+            "rikka.sui"
+        )
+        for (pkg in shizukuPackages) {
+            val launch = packageManager.getLaunchIntentForPackage(pkg)
+            if (launch != null) {
+                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(launch)
+                Toast.makeText(this, "请启动 Shizuku 服务并授权本应用", Toast.LENGTH_LONG).show()
+                return
+            }
+        }
+        // 没装 → 跳应用详情（设置→应用→允许安装未知来源之类）
+        try {
+            val uri = Uri.parse("package:moe.shizuku.privileged.api")
+            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, uri)
+            startActivity(intent)
+        } catch (_: Throwable) {
+            Toast.makeText(this,
+                "请安装 Shizuku 应用（https://shizuku.rikka.app/）或在 Magisk 中安装 Sui 模块",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    /**
      * 独立的 CPU 八核详情卡片 UI 渲染（与上面 updateMetricsUi 完全分开，不修改原卡片）
      *
-     * 显示格式：CPU{idx}: {freq} MHz {load}%  （左边监测工具同款）
-     * 任一未知 → "-- MHz --%" 占位，不造假
+     * P1-4b 增强：
+     *  1) 每个核显示 {标签 · 频率 · 负载% · 状态（空闲/轻载/中载/重载）}
+     *  2) 大核/小核用不同颜色区分：CPU4~CPU7（大核）用 primary 前缀色，CPU0~CPU3（小核）用 text_primary 深灰
+     *  3) 数值真实跳动（来自 IntArray 广播），八核一起刷新
+     *
+     * 显示格式：L/B-XX {freq}MHz {load}% [状态]
+     *   L=Little 小核（CPU0-3），B=Big 大核（CPU4-7）
      */
     private fun updatePerCoreCpuUi(coreFreqMhz: IntArray?, coreLoadPct: IntArray?) {
         val freq = coreFreqMhz ?: IntArray(8) { -1 }
@@ -462,18 +647,34 @@ class MainActivity : AppCompatActivity() {
         val warning = getColor(R.color.warning)
         val danger = getColor(R.color.danger)
         val unknown = getColor(R.color.text_secondary)
+        val big = getColor(R.color.primary)
+        val little = getColor(android.R.color.tab_indicator_text)  // 深灰
 
         for (i in 0 until 8) {
             val tv = tvs[i]
             val f = freq.getOrNull(i) ?: -1
             val l = load.getOrNull(i) ?: -1
-            val freqStr = if (f <= 0) "--" else String.format("%d.0Mhz", f)  // 与左边工具一致："1650.0Mhz"
+
+            // 大小核区分：CPU0-3=Little(A510等)，CPU4-7=Big(A715/X2等，八核手机典型拓扑)
+            val isBig = i >= 4
+            val coreType = if (isBig) "B" else "L"
+
+            val freqStr = if (f <= 0) "--" else String.format("%dMHz", f)
             val loadStr = if (l < 0) "--" else "$l%"
-            tv.text = "CPU$i: $freqStr $loadStr"
+            val state = when {
+                l < 0 -> "未知"
+                l == 0 -> "空闲"
+                l < 30 -> "轻载"
+                l < 70 -> "中载"
+                else -> "重载"
+            }
+            // 前缀颜色区分大小核；负载颜色覆盖前缀来反映当前压力
+            tv.text = "$coreType-CPU$i: $freqStr  $loadStr  $state"
+            val baseColor = if (isBig) big else little
             tv.setTextColor(
                 when {
                     l < 0 -> unknown
-                    l < 60 -> good
+                    l < 60 -> if (l < 1) baseColor else good
                     l < 85 -> warning
                     else -> danger
                 }
@@ -533,29 +734,93 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 检测权限状态（异步，不阻塞主线程）
+     * P1-4b 增强：检测权限状态，显示详细的Shizuku引导提示，错误时显示btnLaunchShizuku
      */
     private fun checkPermissionStatus() {
         val runMode = configManager.getRunMode()
         if (runMode == RunMode.LOG_ONLY) {
-            tvPermissionStatus.text = "权限状态: 纯日志模式（无需权限）"
+            tvPermissionStatus.text = "📝 纯日志模式（无权限也能记录，保护动作仅打日志）"
             tvPermissionStatus.setTextColor(getColor(R.color.text_secondary))
+            btnLaunchShizuku.visibility = android.view.View.GONE
             return
         }
 
         val permMode = configManager.getPermissionMode()
-        tvPermissionStatus.text = "权限状态: 检测中..."
+        tvPermissionStatus.text = "⏳ 权限检测中..."
         tvPermissionStatus.setTextColor(getColor(R.color.text_secondary))
+        btnLaunchShizuku.visibility = android.view.View.GONE
 
-        permissionChecker.checkPermissionStatus(permMode) { status ->
-            if (status.available) {
-                tvPermissionStatus.text = "权限状态: ${status.message}"
-                tvPermissionStatus.setTextColor(getColor(R.color.good))
-            } else {
-                tvPermissionStatus.text = "权限状态: ${status.message}"
-                tvPermissionStatus.setTextColor(getColor(R.color.danger))
+        // 异步检测详细状态
+        Thread {
+            // 1) 先尝试用本地构造的ShizukuActionExecutor.isAvailable/getDetailedStatus快速检测
+            val detailMsg = try {
+                if (permMode == PermissionMode.SHIZUKU) {
+                    val exec = com.spikeguard.executor.ShizukuActionExecutor(this)
+                    val st = exec.getDetailedStatus()
+                    val msg = exec.getStatusHumanMessage()
+                    // 根据状态决定颜色和按钮显示
+                    runOnUiThread {
+                        when (st) {
+                            com.spikeguard.executor.ShizukuDetailedStatus.BINDER_OK -> {
+                                tvPermissionStatus.text = msg
+                                tvPermissionStatus.setTextColor(getColor(R.color.good))
+                                btnLaunchShizuku.visibility = android.view.View.GONE
+                            }
+                            com.spikeguard.executor.ShizukuDetailedStatus.USING_FALLBACK_SHELL -> {
+                                tvPermissionStatus.text = msg
+                                tvPermissionStatus.setTextColor(getColor(R.color.warning))
+                                btnLaunchShizuku.visibility = android.view.View.VISIBLE
+                            }
+                            com.spikeguard.executor.ShizukuDetailedStatus.INITIALIZING -> {
+                                tvPermissionStatus.text = msg
+                                tvPermissionStatus.setTextColor(getColor(R.color.text_secondary))
+                                btnLaunchShizuku.visibility = android.view.View.GONE
+                            }
+                            else -> {
+                                tvPermissionStatus.text = msg
+                                tvPermissionStatus.setTextColor(getColor(R.color.danger))
+                                btnLaunchShizuku.visibility = android.view.View.VISIBLE
+                            }
+                        }
+                    }
+                    return@Thread
+                } else if (permMode == PermissionMode.ROOT) {
+                    val exec = com.spikeguard.executor.RootActionExecutor()
+                    val msg = exec.getStatusHumanMessage()
+                    val st = exec.getDetailedStatus()
+                    runOnUiThread {
+                        if (st == com.spikeguard.executor.ShizukuDetailedStatus.BINDER_OK) {
+                            tvPermissionStatus.text = msg
+                            tvPermissionStatus.setTextColor(getColor(R.color.good))
+                            btnLaunchShizuku.visibility = android.view.View.GONE
+                        } else {
+                            tvPermissionStatus.text = msg
+                            tvPermissionStatus.setTextColor(getColor(R.color.danger))
+                            btnLaunchShizuku.text = "🔧 安装 Root 管理器 (Magisk/KernelSU)"
+                            btnLaunchShizuku.visibility = android.view.View.VISIBLE
+                        }
+                    }
+                    return@Thread
+                }
+                null
+            } catch (_: Throwable) { null }
+
+            // 2) 兜底：走旧的permissionChecker（无详细信息时）
+            permissionChecker.checkPermissionStatus(permMode) { status ->
+                runOnUiThread {
+                    if (status.available) {
+                        tvPermissionStatus.text = "权限状态: ${status.message}"
+                        tvPermissionStatus.setTextColor(getColor(R.color.good))
+                        btnLaunchShizuku.visibility = android.view.View.GONE
+                    } else {
+                        tvPermissionStatus.text = "权限状态: ${status.message}" +
+                                "\n请点击下方按钮启动Shizuku并授权应用"
+                        tvPermissionStatus.setTextColor(getColor(R.color.danger))
+                        btnLaunchShizuku.visibility = android.view.View.VISIBLE
+                    }
+                }
             }
-        }
+        }.start()
     }
 
     /**

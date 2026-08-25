@@ -25,6 +25,28 @@ class RootActionExecutor : ActionExecutor {
 
     override val name = "Root"
 
+    /**
+     * P1-1: Root 模式的详细状态
+     */
+    override fun getDetailedStatus(): ShizukuDetailedStatus {
+        if (!initialized && rootSession == null) {
+            return ShizukuDetailedStatus.INITIALIZING
+        }
+        return if (initialized && rootSession != null) {
+            ShizukuDetailedStatus.BINDER_OK
+        } else {
+            ShizukuDetailedStatus.NOT_INSTALLED
+        }
+    }
+
+    override fun getStatusHumanMessage(): String {
+        return when (getDetailedStatus()) {
+            ShizukuDetailedStatus.BINDER_OK -> "✅ Root 权限已获取（su会话已建立）"
+            ShizukuDetailedStatus.INITIALIZING -> "⏳ 正在请求Root权限..."
+            else -> "❌ Root不可用\n请确保设备已Root并授予本应用超级用户权限（Magisk/KernelSU等）"
+        }
+    }
+
     private var rootSession: Process? = null
     private var outputStream: DataOutputStream? = null
     private var initialized = false
@@ -548,5 +570,68 @@ class RootActionExecutor : ActionExecutor {
         } catch (e: Exception) {
             0
         }
+    }
+
+    // ==========================================================
+    // P1-2b: RootActionExecutor.executeFullProtectionFlow() 真实完整保护流程
+    // 四步 + 1500ms 后无条件恢复
+    // ==========================================================
+    override fun executeFullProtectionFlow(
+        reclaimMemory: Boolean,
+        gpuThrottle: Float,
+        cpuThrottle: Float,
+        boostPriority: Boolean,
+        targetPackageName: String,
+        durationMs: Long
+    ): FullFlowResult {
+        if (!initialized) {
+            Log.w(TAG, "executeFullProtectionFlow called but not initialized")
+            return FullFlowResult(null, null, null, null, null, 0L, 0, 0)
+        }
+        if (paused.get()) {
+            Log.w(TAG, "executeFullProtectionFlow skipped: paused")
+            return FullFlowResult(null, null, null, null, null, 0L, 0, 0)
+        }
+
+        val t0 = System.currentTimeMillis()
+
+        val r1: ActionResult? = if (reclaimMemory) {
+            try { reclaimMemoryInternal() } catch (e: Throwable) {
+                ActionResult(ActionType.RECLAIM_MEMORY, false, "Exception: ${e.message}")
+            }
+        } else null
+
+        val r2: ActionResult = try { setGpuThrottleInternal(gpuThrottle) } catch (e: Throwable) {
+            ActionResult(ActionType.GPU_THROTTLE, false, "Exception: ${e.message}")
+        }
+
+        val r3: ActionResult = try { setCpuThrottleInternal(cpuThrottle) } catch (e: Throwable) {
+            ActionResult(ActionType.CPU_THROTTLE, false, "Exception: ${e.message}")
+        }
+
+        val r4: ActionResult? = if (boostPriority) {
+            try { boostProcessPriorityInternal(targetPackageName) } catch (e: Throwable) {
+                ActionResult(ActionType.BOOST_PRIORITY, false, "Exception: ${e.message}")
+            }
+        } else null
+
+        // ====== 等待 1500ms 保护窗口 ======
+        val waitMs = durationMs.coerceIn(100L, 10_000L)
+        try {
+            Thread.sleep(waitMs)
+        } catch (_: InterruptedException) {
+            Log.w(TAG, "Root full protection sleep interrupted, reset immediately")
+        }
+
+        // ====== 1500ms后无条件恢复 ======
+        val r5: ActionResult = try { resetAllInternal() } catch (e: Throwable) {
+            ActionResult(ActionType.CPU_THROTTLE, false, "Exception: ${e.message}")
+        }
+
+        val total = System.currentTimeMillis() - t0
+        val list = listOfNotNull(r1, r2, r3, r4, r5)
+        val ok = list.count { it.success }
+        Log.i(TAG, "Root full flow done: success=$ok/${list.size}, total=${total}ms")
+        return FullFlowResult(r1, r2, r3, r4, r5, total, ok, list.size)
     }
 }

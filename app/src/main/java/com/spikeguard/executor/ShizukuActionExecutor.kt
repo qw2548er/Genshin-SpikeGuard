@@ -60,6 +60,82 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
     }
 
     /**
+     * ===== P1-1: 详细的 Shizuku 连接状态检测 =====
+     * 提供给UI显示明确的错误提示和引导按钮
+     */
+    override fun getDetailedStatus(): ShizukuDetailedStatus {
+        // 1. 先检查是否安装
+        val pm = context.packageManager
+        val packages = try { pm.getInstalledPackages(0) } catch (_: Exception) { emptyList() }
+        val hasShizuku = packages.any { it.packageName == SHIZUKU_PACKAGE }
+        val hasSui = packages.any { it.packageName == SUI_PACKAGE }
+
+        if (!hasShizuku && !hasSui) {
+            return ShizukuDetailedStatus.NOT_INSTALLED
+        }
+
+        // 2. 如果还没初始化，告诉UI正在初始化
+        if (!initialized && handlerThread?.isAlive != true) {
+            return ShizukuDetailedStatus.INITIALIZING
+        }
+
+        // 3. 已初始化的情况：看是否用了Binder
+        if (initialized) {
+            return if (useShizukuApi) {
+                // 4. 最后验证权限是否依然有效
+                try {
+                    if (Shizuku.pingBinder()) {
+                        ShizukuDetailedStatus.BINDER_OK
+                    } else {
+                        ShizukuDetailedStatus.SERVICE_NOT_RUNNING
+                    }
+                } catch (_: Throwable) {
+                    ShizukuDetailedStatus.SERVICE_NOT_RUNNING
+                }
+            } else {
+                ShizukuDetailedStatus.USING_FALLBACK_SHELL
+            }
+        }
+
+        // 4. 初始化失败：尝试判断原因（不阻塞，只是诊断）
+        return try {
+            val binderAlive = try { Shizuku.pingBinder() } catch (_: Throwable) { false }
+            if (!binderAlive) {
+                ShizukuDetailedStatus.SERVICE_NOT_RUNNING
+            } else {
+                // Binder alive但initialize失败=权限没给
+                val uid = try { Shizuku.getUid() } catch (_: Throwable) { -1 }
+                if (uid < 0) {
+                    ShizukuDetailedStatus.PERMISSION_DENIED
+                } else {
+                    ShizukuDetailedStatus.SERVICE_NOT_RUNNING
+                }
+            }
+        } catch (_: Throwable) {
+            ShizukuDetailedStatus.UNKNOWN
+        }
+    }
+
+    override fun getStatusHumanMessage(): String {
+        return when (getDetailedStatus()) {
+            ShizukuDetailedStatus.NOT_INSTALLED ->
+                "❌ Shizuku/Sui 未安装\n请先从应用商店安装 Shizuku 或 Sui（Magisk模块）"
+            ShizukuDetailedStatus.SERVICE_NOT_RUNNING ->
+                "⚠️ Shizuku 服务未启动\n请打开 Shizuku 应用，启动服务（通过ADB无线调试或Root），并在\"已授权应用\"中允许本应用"
+            ShizukuDetailedStatus.PERMISSION_DENIED ->
+                "🔒 Shizuku 权限被拒绝\n请打开 Shizuku 应用 → 已授权应用 → 找到 Genshin SpikeGuard → 允许访问"
+            ShizukuDetailedStatus.BINDER_OK ->
+                "✅ Shizuku 连接正常（Binder API 已就绪，可执行系统级命令）"
+            ShizukuDetailedStatus.USING_FALLBACK_SHELL ->
+                "⚠️ 使用普通Shell降级模式（无Root/Shell权限）\nGPU钳制和内存回收可能无法生效，建议启动Shizuku服务并授权"
+            ShizukuDetailedStatus.INITIALIZING ->
+                "⏳ Shizuku 正在初始化..."
+            ShizukuDetailedStatus.UNKNOWN ->
+                "❓ Shizuku 状态未知，请点击\"启动保护\"后重试检测"
+        }
+    }
+
+    /**
      * 检查 Shizuku 服务是否可用
      * 注意：此方法也不应在主线程调用，这里做了轻量级检查
      */
@@ -643,5 +719,72 @@ class ShizukuActionExecutor(private val context: Context) : ActionExecutor {
         } catch (e: Exception) {
             0
         }
+    }
+
+    // ==========================================================
+    // P1-2a: executeFullProtectionFlow() 真实完整保护流程
+    // 四步 + 1500ms 后无条件恢复
+    // ==========================================================
+    override fun executeFullProtectionFlow(
+        reclaimMemory: Boolean,
+        gpuThrottle: Float,
+        cpuThrottle: Float,
+        boostPriority: Boolean,
+        targetPackageName: String,
+        durationMs: Long
+    ): FullFlowResult {
+        if (!initialized) {
+            Log.w(TAG, "executeFullProtectionFlow called but not initialized")
+            val fail = ActionResult(ActionType.FULL_FLOW, false, "Not initialized")
+            return FullFlowResult(null, null, null, null, null, 0L, 0, 0)
+        }
+        if (paused.get()) {
+            Log.w(TAG, "executeFullProtectionFlow skipped: paused")
+            val fail = ActionResult(ActionType.FULL_FLOW, false, "Paused (silent mode)")
+            return FullFlowResult(null, null, null, null, null, 0L, 0, 0)
+        }
+
+        val t0 = System.currentTimeMillis()
+
+        // 同步阻塞执行（调用方已经在后台线程），不用 runOnBackgroundWithTimeout 再包一层
+        val r1: ActionResult? = if (reclaimMemory) {
+            try { reclaimMemoryInternal() } catch (e: Throwable) {
+                ActionResult(ActionType.RECLAIM_MEMORY, false, "Exception: ${e.message}")
+            }
+        } else null
+
+        val r2: ActionResult = try { setGpuThrottleInternal(gpuThrottle) } catch (e: Throwable) {
+            ActionResult(ActionType.GPU_THROTTLE, false, "Exception: ${e.message}")
+        }
+
+        val r3: ActionResult = try { setCpuThrottleInternal(cpuThrottle) } catch (e: Throwable) {
+            ActionResult(ActionType.CPU_THROTTLE, false, "Exception: ${e.message}")
+        }
+
+        val r4: ActionResult? = if (boostPriority) {
+            try { boostProcessPriorityInternal(targetPackageName) } catch (e: Throwable) {
+                ActionResult(ActionType.BOOST_PRIORITY, false, "Exception: ${e.message}")
+            }
+        } else null
+
+        // ====== 关键：等待 durationMs（默认1500ms）保护窗口 ======
+        val waitMs = durationMs.coerceIn(100L, 10_000L)
+        try {
+            Thread.sleep(waitMs)
+        } catch (_: InterruptedException) {
+            Log.w(TAG, "Full protection sleep interrupted, will reset immediately")
+        }
+
+        // ====== 关键：1500ms后无条件恢复全部系统参数 ======
+        val r5: ActionResult = try { resetAllInternal() } catch (e: Throwable) {
+            ActionResult(ActionType.CPU_THROTTLE, false, "Exception: ${e.message}")
+        }
+
+        val total = System.currentTimeMillis() - t0
+        val list = listOfNotNull(r1, r2, r3, r4, r5)
+        val ok = list.count { it.success }
+        Log.i(TAG, "Full protection flow done: success=$ok/${list.size}, total=${total}ms" +
+                " (wait=${waitMs}ms, gpu=${(gpuThrottle*100).toInt()}%, cpu=${(cpuThrottle*100).toInt()}%)")
+        return FullFlowResult(r1, r2, r3, r4, r5, total, ok, list.size)
     }
 }

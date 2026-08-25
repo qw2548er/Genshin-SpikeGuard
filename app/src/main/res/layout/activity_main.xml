@@ -57,10 +57,10 @@
                     android:layout_marginBottom="12dp"/>
 
                 <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="horizontal"
-                    android:gravity="center">
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center">
 
                     <Button
                         android:id="@+id/btnStart"
@@ -78,6 +78,32 @@
                         android:layout_weight="1"
                         android:text="停止保护"
                         android:enabled="false"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"/>
+                </LinearLayout>
+
+                <!-- P1-4a: 测试保护按钮 + 场景显示 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:layout_marginTop="12dp">
+
+                    <TextView
+                        android:id="@+id/tvScene"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="当前场景: 待识别"
+                        android:textSize="13sp"
+                        android:textColor="@color/text_secondary"
+                        android:gravity="center"
+                        android:layout_marginBottom="8dp"/>
+
+                    <Button
+                        android:id="@+id/btnTestProtection"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="🧪 测试保护（手动触发完整1500ms流程）"
+                        android:textSize="14sp"
                         style="@style/Widget.MaterialComponents.Button.OutlinedButton"/>
                 </LinearLayout>
             </LinearLayout>
@@ -301,6 +327,7 @@
                     android:text="运行模式: 仅日志"
                     android:textSize="14sp"/>
 
+                <!-- P1-4a: Shizuku 详细引导提示（多行，含具体原因和引导） -->
                 <TextView
                     android:id="@+id/tvPermissionStatus"
                     android:layout_width="match_parent"
@@ -308,7 +335,19 @@
                     android:text="权限状态: 检测中..."
                     android:textSize="12sp"
                     android:textColor="@color/text_secondary"
-                    android:layout_marginTop="4dp"/>
+                    android:lineSpacingExtra="3dp"
+                    android:layout_marginTop="8dp"/>
+
+                <!-- P1-4a: Shizuku 未启动时"启动Shizuku"按钮 -->
+                <Button
+                    android:id="@+id/btnLaunchShizuku"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="🔧 启动 Shizuku / 授权应用"
+                    android:textSize="13sp"
+                    android:visibility="gone"
+                    android:layout_marginTop="8dp"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"/>
             </LinearLayout>
         </androidx.cardview.widget.CardView>
 
