@@ -83,7 +83,7 @@ class UiStateBridge(private val context: Context) {
         try {
             val intent = Intent(ACTION_UI_STATE_UPDATE).apply {
                 setPackage(context.packageName)
-                // 逐个添加基本类型
+                // 逐个添加基本类型 + 数组
                 data.forEach { (key, value) ->
                     when (value) {
                         is Int -> putExtra(key, value)
@@ -92,6 +92,12 @@ class UiStateBridge(private val context: Context) {
                         is Boolean -> putExtra(key, value)
                         is String -> putExtra(key, value)
                         is Double -> putExtra(key, value.toFloat())
+                        is IntArray -> putExtra(key, value)
+                        is FloatArray -> putExtra(key, value)
+                        is ShortArray -> putExtra(key, value)
+                        is LongArray -> putExtra(key, value)
+                        is ByteArray -> putExtra(key, value)
+                        is CharArray -> putExtra(key, value)
                     }
                 }
             }

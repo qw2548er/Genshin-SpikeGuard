@@ -133,6 +133,7 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
         val gpuLoad = readGpuLoad()
         val gpuFreq = readGpuFreq()
         val cpuLoad = readCpuLoad()
+        val (coreFreq, coreLoad) = readPerCoreCpu(cpuLoad)
         val memoryUsed = readMemoryUsed()
         val memoryTotal = readMemoryTotal()
         val temperature = readTemperature()
@@ -151,8 +152,111 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
             memoryUsedMb = memoryUsed,
             memoryTotalMb = memoryTotal,
             temperature = temperature,
-            entityEstimate = entityEstimate
+            entityEstimate = entityEstimate,
+            coreFreqMhz = coreFreq,
+            coreLoadPct = coreLoad
         )
+    }
+
+    // ========== 逐核 CPU 采集（与 LightweightMetricsPoller 相同策略，保持两端一致）==========
+    private fun readPerCoreCpu(aggCpuLoad: Float): Pair<IntArray, IntArray> {
+        val freqArr = IntArray(8) { -1 }
+        val loadArr = IntArray(8) { -1 }
+
+        for (i in 0 until 8) {
+            val curKhz = readFileAnyWay("/sys/devices/system/cpu/cpu$i/cpufreq/scaling_cur_freq")?.trim()?.toIntOrNull()
+            val maxKhz = readFileAnyWay("/sys/devices/system/cpu/cpu$i/cpufreq/cpuinfo_max_freq")?.trim()?.toIntOrNull()
+            if (curKhz != null && curKhz > 0) freqArr[i] = curKhz / 1000
+            if (curKhz != null && maxKhz != null && maxKhz > 0) {
+                val r = (curKhz.toFloat() / maxKhz.toFloat()).coerceIn(0f, 1f)
+                val base = if (aggCpuLoad >= 0f) aggCpuLoad else 50f
+                val factor = if (r >= 0.95f) 1f else r / 0.95f
+                val est = (base * Math.pow(factor.toDouble(), 0.9).toFloat()).coerceIn(0f, 99f)
+                loadArr[i] = Math.round(est)
+            }
+        }
+        // time_in_state 补充
+        for (i in 0 until 8) {
+            if (loadArr[i] >= 0) continue
+            val lines = try {
+                readFileAnyWay("/sys/devices/system/cpu/cpu$i/cpufreq/stats/time_in_state")
+                    ?.lineSequence()?.toList().orEmpty()
+            } catch (_: Throwable) { emptyList() }
+            if (lines.isEmpty()) continue
+            var coreMax = 0L; var active = 0L; var total = 0L
+            for (l in lines) {
+                val p = l.trim().split("\\s+".toRegex())
+                if (p.size < 2) continue
+                val f = p[0].toLongOrNull() ?: continue
+                val t = p[1].toLongOrNull() ?: continue
+                if (f > coreMax) coreMax = f
+                total += t
+                if (f >= coreMax * 0.8) active += t
+            }
+            if (total > 0 && coreMax > 0) {
+                val r = active.toFloat() / total.toFloat()
+                val base = if (aggCpuLoad >= 0f) aggCpuLoad else 50f
+                loadArr[i] = Math.round((base * r.coerceIn(0f, 1f)).coerceIn(0f, 99f))
+            }
+        }
+        // /proc/stat 逐核 cpuN 双采样（最后覆盖）
+        try {
+            fun parseNth(s: String, idx: Int): Pair<Long, Long>? {
+                val target = "cpu$idx"
+                for (l in s.lineSequence()) {
+                    val t = l.trim()
+                    if (!t.startsWith(target)) continue
+                    val parts = t.split("\\s+".toRegex())
+                    if (parts.size < 8) return null
+                    val user = parts[1].toLongOrNull() ?: return null
+                    val nice = parts[2].toLongOrNull() ?: return null
+                    val sys = parts[3].toLongOrNull() ?: return null
+                    val idle = parts[4].toLongOrNull() ?: return null
+                    val iow = parts[5].toLongOrNull() ?: return null
+                    val irq = parts[6].toLongOrNull() ?: return null
+                    val sirq = parts[7].toLongOrNull() ?: return null
+                    return (user + nice + sys + idle + iow + irq + sirq) to (idle + iow)
+                }
+                return null
+            }
+            val r1 = readFileAnyWay("/proc/stat")
+            if (r1 != null) {
+                val s1 = (0 until 8).map { parseNth(r1, it) }
+                try { Thread.sleep(40L) } catch (_: Throwable) {}
+                val r2 = readFileAnyWay("/proc/stat")
+                if (r2 != null) {
+                    for (i in 0 until 8) {
+                        val p1 = s1[i] ?: continue
+                        val p2 = parseNth(r2, i) ?: continue
+                        val dt = p2.first - p1.first; val di = p2.second - p1.second
+                        if (dt > 0) loadArr[i] = Math.round((((dt - di).toFloat() / dt) * 100f).coerceIn(0f, 99f))
+                    }
+                }
+            }
+        } catch (_: Throwable) {}
+        // 整体缩放：贴近 aggCpuLoad 均值
+        if (aggCpuLoad >= 0f) {
+            val valid = loadArr.filter { it >= 0 }
+            if (valid.isNotEmpty()) {
+                val avg = valid.average().toFloat()
+                if (avg > 0.5f) {
+                    val ratio = (aggCpuLoad / avg).coerceIn(0.7f, 1.5f)
+                    for (i in 0 until 8) {
+                        if (loadArr[i] < 0) continue
+                        loadArr[i] = Math.round((loadArr[i] * ratio).coerceIn(0f, 99f))
+                    }
+                }
+            } else {
+                val base = Math.round(aggCpuLoad.coerceIn(0f, 99f))
+                for (i in 0 until 8) {
+                    if (loadArr[i] < 0 && freqArr[i] > 0) {
+                        val delta = if (freqArr[i] >= 2000) 2 else -1
+                        loadArr[i] = (base + delta).coerceIn(0, 99)
+                    }
+                }
+            }
+        }
+        return freqArr to loadArr
     }
 
     private fun logSample(sample: MetricsSample) {

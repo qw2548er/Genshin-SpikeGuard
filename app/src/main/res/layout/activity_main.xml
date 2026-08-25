@@ -165,6 +165,105 @@
             </LinearLayout>
         </androidx.cardview.widget.CardView>
 
+        <!-- CPU 八核详情卡片（独立卡片，不与上面的合并） -->
+        <androidx.cardview.widget.CardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"
+            app:cardCornerRadius="12dp"
+            app:cardElevation="4dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="CPU 八核详情"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    android:layout_marginBottom="12dp"/>
+
+                <!-- Row 1: CPU0  CPU1 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginBottom="6dp">
+                    <TextView android:id="@+id/tvCpuCore0"
+                        android:layout_width="0dp" android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:text="CPU0: -- MHz --%"
+                        android:textSize="12sp"/>
+                    <TextView android:id="@+id/tvCpuCore1"
+                        android:layout_width="0dp" android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:text="CPU1: -- MHz --%"
+                        android:textSize="12sp"
+                        android:gravity="end"/>
+                </LinearLayout>
+
+                <!-- Row 2: CPU2  CPU3 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginBottom="6dp">
+                    <TextView android:id="@+id/tvCpuCore2"
+                        android:layout_width="0dp" android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:text="CPU2: -- MHz --%"
+                        android:textSize="12sp"/>
+                    <TextView android:id="@+id/tvCpuCore3"
+                        android:layout_width="0dp" android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:text="CPU3: -- MHz --%"
+                        android:textSize="12sp"
+                        android:gravity="end"/>
+                </LinearLayout>
+
+                <!-- Row 3: CPU4  CPU5 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginBottom="6dp">
+                    <TextView android:id="@+id/tvCpuCore4"
+                        android:layout_width="0dp" android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:text="CPU4: -- MHz --%"
+                        android:textSize="12sp"/>
+                    <TextView android:id="@+id/tvCpuCore5"
+                        android:layout_width="0dp" android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:text="CPU5: -- MHz --%"
+                        android:textSize="12sp"
+                        android:gravity="end"/>
+                </LinearLayout>
+
+                <!-- Row 4: CPU6  CPU7 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+                    <TextView android:id="@+id/tvCpuCore6"
+                        android:layout_width="0dp" android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:text="CPU6: -- MHz --%"
+                        android:textSize="12sp"/>
+                    <TextView android:id="@+id/tvCpuCore7"
+                        android:layout_width="0dp" android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:text="CPU7: -- MHz --%"
+                        android:textSize="12sp"
+                        android:gravity="end"/>
+                </LinearLayout>
+            </LinearLayout>
+        </androidx.cardview.widget.CardView>
+
         <!-- 状态信息卡片 -->
         <androidx.cardview.widget.CardView
             android:layout_width="match_parent"

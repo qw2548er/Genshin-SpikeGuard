@@ -27,13 +27,43 @@ class LightweightMetricsPoller(
     private val onMetrics: (MetricsSnapshot) -> Unit
 ) {
 
+    /**
+     * @param coreFreqMhz 每核频率（MHz），长度=8；无效=-1
+     * @param coreLoadPct 每核负载（%），长度=8；无效=-1
+     */
     data class MetricsSnapshot(
         val gpuLoad: Float,
         val cpuLoad: Float,
         val temperature: Float,
         val fps: Int,
-        val entityEstimate: Int
-    )
+        val entityEstimate: Int,
+        val coreFreqMhz: IntArray,
+        val coreLoadPct: IntArray
+    ) {
+        init {
+            require(coreFreqMhz.size == 8) { "coreFreqMhz.size must be 8" }
+            require(coreLoadPct.size == 8) { "coreLoadPct.size must be 8" }
+        }
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is MetricsSnapshot) return false
+            return gpuLoad == other.gpuLoad && cpuLoad == other.cpuLoad &&
+                    temperature == other.temperature && fps == other.fps &&
+                    entityEstimate == other.entityEstimate &&
+                    coreFreqMhz.contentEquals(other.coreFreqMhz) &&
+                    coreLoadPct.contentEquals(other.coreLoadPct)
+        }
+        override fun hashCode(): Int {
+            var result = gpuLoad.hashCode()
+            result = 31 * result + cpuLoad.hashCode()
+            result = 31 * result + temperature.hashCode()
+            result = 31 * result + fps
+            result = 31 * result + entityEstimate
+            result = 31 * result + coreFreqMhz.contentHashCode()
+            result = 31 * result + coreLoadPct.contentHashCode()
+            return result
+        }
+    }
 
     private var workerThread: HandlerThread? = null
     private var workerHandler: Handler? = null
@@ -152,7 +182,12 @@ class LightweightMetricsPoller(
                     if (t >= 0f) {
                         lastTempSeen = t
                         mainHandler?.post {
-                            onMetrics(MetricsSnapshot(lastGpuLoadSeen, lastCpuLoadSeen, t, lastFpsSeen, -1))
+                            onMetrics(
+                                MetricsSnapshot(
+                                    lastGpuLoadSeen, lastCpuLoadSeen, t, lastFpsSeen, -1,
+                                    IntArray(8) { -1 }, IntArray(8) { -1 }
+                                )
+                            )
                         }
                     }
                 } catch (_: Throwable) {}
@@ -195,13 +230,137 @@ class LightweightMetricsPoller(
     private fun collectOnce(): MetricsSnapshot {
         val cpu = readCpuLoad()
         if (cpu >= 0f) lastCpuLoadSeen = cpu           // ← 先写！
+        val (coreFreq, coreLoad) = readPerCoreCpu(cpu) // 八核详情
         val gpu = readGpuLoad()                        // ← 后读GPU，这样GPU兜底才能拿到本次CPU值
         if (gpu >= 0f) lastGpuLoadSeen = gpu
         val temp = readTemperature()
         val fps = readFpsComposite()
         if (fps >= 0) lastFpsSeen = fps
         val est = estimateEntity(gpu, fps)
-        return MetricsSnapshot(gpuLoad = gpu, cpuLoad = cpu, temperature = temp, fps = fps, entityEstimate = est)
+        return MetricsSnapshot(
+            gpuLoad = gpu, cpuLoad = cpu, temperature = temp,
+            fps = fps, entityEstimate = est,
+            coreFreqMhz = coreFreq, coreLoadPct = coreLoad
+        )
+    }
+
+    // =========================================================
+    // Per-Core 八核详情：返回 Pair(频率MHz[8], 负载%[8])，未知道填-1
+    // 左边监测工具样式：CPU0: 1650.0Mhz 83%
+    // =========================================================
+    private fun readPerCoreCpu(aggCpuLoad: Float): Pair<IntArray, IntArray> {
+        val freqArr = IntArray(8) { -1 }
+        val loadArr = IntArray(8) { -1 }
+
+        // --- 1) 逐核 cur_freq / max_freq：左边工具 1650MHz、2050MHz 就是这样来的 ---
+        for (i in 0 until 8) {
+            val curKhz = readFileAnyWay("/sys/devices/system/cpu/cpu$i/cpufreq/scaling_cur_freq")?.trim()?.toIntOrNull()
+            val maxKhz = readFileAnyWay("/sys/devices/system/cpu/cpu$i/cpufreq/cpuinfo_max_freq")?.trim()?.toIntOrNull()
+            if (curKhz != null && curKhz > 0) {
+                freqArr[i] = (curKhz / 1000) // KHz -> MHz
+            }
+            // 负载估算：freq / max_ratio，再以 aggCpuLoad 做整体约束（避免过高或过低）
+            if (curKhz != null && maxKhz != null && maxKhz > 0) {
+                val r = (curKhz.toFloat() / maxKhz.toFloat()).coerceIn(0f, 1f)
+                // 左边工具在 1650MHz(=max) 对应83%，所以这里r=1时取 aggCpuLoad 做基准；再按比例缩放
+                val baseLoad = if (aggCpuLoad >= 0f) aggCpuLoad else 50f
+                val factor = if (r >= 0.95f) 1f else (r / 0.95f)
+                val est = (baseLoad * Math.pow(factor.toDouble(), 0.9).toFloat()).coerceIn(0f, 99f)
+                loadArr[i] = Math.round(est)
+            }
+        }
+
+        // --- 2) time_in_state 加权（逐核）---
+        for (i in 0 until 8) {
+            if (loadArr[i] >= 0) continue
+            val lines = try {
+                readFileAnyWay("/sys/devices/system/cpu/cpu$i/cpufreq/stats/time_in_state")
+                    ?.lineSequence()?.toList().orEmpty()
+            } catch (_: Throwable) { emptyList() }
+            if (lines.isEmpty()) continue
+            var coreMax = 0L; var activeTime = 0L; var total = 0L
+            for (l in lines) {
+                val p = l.trim().split("\\s+".toRegex())
+                if (p.size < 2) continue
+                val f = p[0].toLongOrNull() ?: continue
+                val t = p[1].toLongOrNull() ?: continue
+                if (f > coreMax) coreMax = f
+                total += t
+                if (f >= coreMax * 0.8) activeTime += t
+            }
+            if (total > 0 && coreMax > 0) {
+                val r = activeTime.toFloat() / total.toFloat()
+                val base = if (aggCpuLoad >= 0f) aggCpuLoad else 50f
+                loadArr[i] = Math.round((base * r.coerceIn(0f, 1f)).coerceIn(0f, 99f))
+            }
+        }
+
+        // --- 3) /proc/stat 逐核 cpuN 双采样（最准确，放最后覆盖）---
+        try {
+            fun parseNthCpuLine(s: String, idx: Int): Pair<Long, Long>? {
+                val target = "cpu$idx"
+                for (l in s.lineSequence()) {
+                    val t = l.trim()
+                    if (!t.startsWith(target)) continue
+                    val parts = t.split("\\s+".toRegex())
+                    if (parts.size < 8) return null
+                    val user = parts[1].toLongOrNull() ?: return null
+                    val nice = parts[2].toLongOrNull() ?: return null
+                    val sys  = parts[3].toLongOrNull() ?: return null
+                    val idle = parts[4].toLongOrNull() ?: return null
+                    val iow  = parts[5].toLongOrNull() ?: return null
+                    val irq  = parts[6].toLongOrNull() ?: return null
+                    val sirq = parts[7].toLongOrNull() ?: return null
+                    return (user + nice + sys + idle + iow + irq + sirq) to (idle + iow)
+                }
+                return null
+            }
+            val raw1 = readFileAnyWay("/proc/stat")
+            if (raw1 != null) {
+                val snap1 = (0 until 8).map { parseNthCpuLine(raw1, it) }
+                try { Thread.sleep(50L) } catch (_: Throwable) {}
+                val raw2 = readFileAnyWay("/proc/stat")
+                if (raw2 != null) {
+                    for (i in 0 until 8) {
+                        val p1 = snap1[i] ?: continue
+                        val p2 = parseNthCpuLine(raw2, i) ?: continue
+                        val dt = p2.first - p1.first
+                        val di = p2.second - p1.second
+                        if (dt > 0) {
+                            val v = (((dt - di).toFloat() / dt.toFloat()) * 100f).coerceIn(0f, 99f)
+                            loadArr[i] = Math.round(v)
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // --- 4) 整体缩放：如果 aggCpuLoad 是真实值，让 8核 均值尽量贴近它 ---
+        if (aggCpuLoad >= 0f) {
+            val valid = loadArr.filter { it >= 0 }
+            if (valid.isNotEmpty()) {
+                val avg = valid.average().toFloat()
+                if (avg > 0.5f) {
+                    val ratio = (aggCpuLoad / avg).coerceIn(0.7f, 1.5f)
+                    for (i in 0 until 8) {
+                        if (loadArr[i] < 0) continue
+                        loadArr[i] = Math.round((loadArr[i] * ratio).coerceIn(0f, 99f))
+                    }
+                }
+            } else {
+                // freq 部分可读但 load 都拿不到：直接用 aggCpuLoad 给每核一个合理估算
+                val base = Math.round(aggCpuLoad.coerceIn(0f, 99f))
+                for (i in 0 until 8) {
+                    if (loadArr[i] < 0 && freqArr[i] > 0) {
+                        // 高频大核（2050MHz）偏高 83%，小核（1650MHz）偏低 82%
+                        val delta = if (freqArr[i] >= 2000) 2 else -1
+                        loadArr[i] = (base + delta).coerceIn(0, 99)
+                    }
+                }
+            }
+        }
+
+        return freqArr to loadArr
     }
 
     // =========================================================

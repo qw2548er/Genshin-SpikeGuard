@@ -50,6 +50,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvMode: TextView
     private lateinit var tvPermissionStatus: TextView
 
+    // CPU 八核详情独立卡片（与上面实时性能卡片完全分开）
+    private lateinit var tvCpuCore0: TextView
+    private lateinit var tvCpuCore1: TextView
+    private lateinit var tvCpuCore2: TextView
+    private lateinit var tvCpuCore3: TextView
+    private lateinit var tvCpuCore4: TextView
+    private lateinit var tvCpuCore5: TextView
+    private lateinit var tvCpuCore6: TextView
+    private lateinit var tvCpuCore7: TextView
+
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
     private lateinit var switchMode: Switch
@@ -121,6 +131,16 @@ class MainActivity : AppCompatActivity() {
         tvProtections = findViewById(R.id.tvProtections)
         tvMode = findViewById(R.id.tvMode)
         tvPermissionStatus = findViewById(R.id.tvPermissionStatus)
+
+        // CPU 八核详情独立卡片
+        tvCpuCore0 = findViewById(R.id.tvCpuCore0)
+        tvCpuCore1 = findViewById(R.id.tvCpuCore1)
+        tvCpuCore2 = findViewById(R.id.tvCpuCore2)
+        tvCpuCore3 = findViewById(R.id.tvCpuCore3)
+        tvCpuCore4 = findViewById(R.id.tvCpuCore4)
+        tvCpuCore5 = findViewById(R.id.tvCpuCore5)
+        tvCpuCore6 = findViewById(R.id.tvCpuCore6)
+        tvCpuCore7 = findViewById(R.id.tvCpuCore7)
 
         btnStart = findViewById(R.id.btnStart)
         btnStop = findViewById(R.id.btnStop)
@@ -290,8 +310,12 @@ class MainActivity : AppCompatActivity() {
         val protectionsToday = extras.getInt("protections_today", 0)
         val riskLevel = extras.getString("risk_level", "LOW") ?: "LOW"
         val silentMode = extras.getBoolean("silent_mode", false)
+        // 八核详情（来自 :guard 进程广播 GpuFrameCollector 的 METRICS_SAMPLE）
+        val coreFreq = extras.getIntArray("core_freq_mhz") ?: IntArray(8) { -1 }
+        val coreLoad = extras.getIntArray("core_load_pct") ?: IntArray(8) { -1 }
 
         updateMetricsUi(fps, gpuLoad, cpuLoad, temperature, entityEstimate)
+        updatePerCoreCpuUi(coreFreq, coreLoad)
 
         tvProtections.text = "今日保护: $protectionsToday 次"
         tvRiskLevel.text = "风险等级: $riskLevel"
@@ -310,6 +334,7 @@ class MainActivity : AppCompatActivity() {
         val poller = LightweightMetricsPoller(this) { snap ->
             metricsSeen = true
             updateMetricsUi(snap.fps, snap.gpuLoad, snap.cpuLoad, snap.temperature, snap.entityEstimate)
+            updatePerCoreCpuUi(snap.coreFreqMhz, snap.coreLoadPct)
         }
         localPoller = poller
         poller.start()
@@ -416,6 +441,40 @@ class MainActivity : AppCompatActivity() {
                 when {
                     entityEstimate < 30 -> good
                     entityEstimate < 80 -> warning
+                    else -> danger
+                }
+            )
+        }
+    }
+
+    /**
+     * 独立的 CPU 八核详情卡片 UI 渲染（与上面 updateMetricsUi 完全分开，不修改原卡片）
+     *
+     * 显示格式：CPU{idx}: {freq} MHz {load}%  （左边监测工具同款）
+     * 任一未知 → "-- MHz --%" 占位，不造假
+     */
+    private fun updatePerCoreCpuUi(coreFreqMhz: IntArray?, coreLoadPct: IntArray?) {
+        val freq = coreFreqMhz ?: IntArray(8) { -1 }
+        val load = coreLoadPct ?: IntArray(8) { -1 }
+        val tvs = arrayOf(tvCpuCore0, tvCpuCore1, tvCpuCore2, tvCpuCore3,
+                          tvCpuCore4, tvCpuCore5, tvCpuCore6, tvCpuCore7)
+        val good = getColor(R.color.good)
+        val warning = getColor(R.color.warning)
+        val danger = getColor(R.color.danger)
+        val unknown = getColor(R.color.text_secondary)
+
+        for (i in 0 until 8) {
+            val tv = tvs[i]
+            val f = freq.getOrNull(i) ?: -1
+            val l = load.getOrNull(i) ?: -1
+            val freqStr = if (f <= 0) "--" else String.format("%d.0Mhz", f)  // 与左边工具一致："1650.0Mhz"
+            val loadStr = if (l < 0) "--" else "$l%"
+            tv.text = "CPU$i: $freqStr $loadStr"
+            tv.setTextColor(
+                when {
+                    l < 0 -> unknown
+                    l < 60 -> good
+                    l < 85 -> warning
                     else -> danger
                 }
             )
@@ -584,9 +643,13 @@ class MainActivity : AppCompatActivity() {
         val entityEstimate = data["entity_estimate"] as? Int ?: -1
         val isProtecting = data["is_protecting"] as? Boolean ?: false
         val protectionsToday = data["protections_today"] as? Int ?: 0
+        val coreFreq = data["core_freq_mhz"] as? IntArray ?: IntArray(8) { -1 }
+        val coreLoad = data["core_load_pct"] as? IntArray ?: IntArray(8) { -1 }
 
         // 性能6字段：统一走 updateMetricsUi（未知→--，绝不显示假底座数）
         updateMetricsUi(fps, gpuLoad, cpuLoad, temperature, entityEstimate)
+        // 独立八核卡片
+        updatePerCoreCpuUi(coreFreq, coreLoad)
 
         // 统计字段
         tvProtections.text = "今日保护: $protectionsToday 次"
