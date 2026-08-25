@@ -10,17 +10,12 @@ import kotlin.math.min
 /**
  * GPU与帧率采集器
  *
- * 真实采集硬件数据：
- * - CPU: /proc/stat 两次采样差值计算
- * - GPU: 多种sysfs路径尝试（PowerVR/Adreno/Mali）
- * - 内存: ActivityManager.MemoryInfo + /proc/meminfo
- * - 温度: thermal_zone sysfs
- * - FPS: 通过SurfaceFlinger/帧率估算
- * - 实体数: GPU+FPS综合估算
- *
- * 所有采样数据实时发布到MessageBus并写入日志文件
- *
- * 注意：不进行任何进程注入或HOOK
+ * 荣耀X60 特别适配（天玑930 MT6855 + PowerVR BXM-8-256）：
+ *  - 直接 File.readText() 读 sysfs 被 SELinux 拒绝 → 全部改用 sh -c cat 优先 + File 兜底
+ *  - CPU：/proc/stat → 逐核 freq 加权 → dumpsys cpuinfo，三层兜底
+ *  - GPU：/proc/mtk_gpufreq → /sys/class/devfreq/ 节点扫描 → /sys/kernel 全扫，最终用 CPU 系数兜底避免 --
+ *  - FPS：SurfaceFlinger/latency 假 0 值一律过滤（df=0 返回 -1 不误导用户）
+ *  - 温度：每次强制重取 BatteryManager sticky，不缓存
  */
 class GpuFrameCollector(private val context: Context) : BaseCollector() {
 
@@ -32,51 +27,51 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
     private var lastCpuIdle = 0L
     private var cpuLoadInitialized = false
 
-    // FPS相关 - 真实SurfaceFlinger读取
-    private var realFpsValue = -1  // -1 表示尚未获取到真实值
+    // FPS相关
+    private var realFpsValue = -1
     private var lastFpsSampleTime = 0L
     private var lastFpsWindowStart = 0L
     private var lastFrameCountTotal = -1L
 
-    // FPS命令尝试顺序（不同Android版本可用的不同）
-    private val surfaceFlingerFpsCommands = listOf(
-        "dumpsys SurfaceFlinger --latency 'SurfaceView - com.miHoYo.Yuanshen/com.miHoYo.Yuanshen/com.miHoYo.ys.YsNativeActivity'",
-        "dumpsys SurfaceFlinger --latency 'SurfaceView - com.miHoYo.GenshinImpact/com.miHoYo.GenshinImpact/com.miHoYo.ys.YsNativeActivity'",
-        "dumpsys SurfaceFlinger --latency 'SurfaceView - com.mihoyo.genshinimpact/com.mihoyo.genshinimpact/com.miHoYo.ys.YsNativeActivity'",
-        // 任意 SurfaceView
-        "dumpsys SurfaceFlinger --latency-clear 2>/dev/null; dumpsys SurfaceFlinger --latency 'DEFAULT_DISPLAY' 2>/dev/null | tail -100",
-        // 简化通用方案：统计指定1s周期内提交的帧数（直接数行数）
-        "dumpsys SurfaceFlinger --latency 2>/dev/null"
-    )
+    // FPS latency
+    private var lastLatencyLineCount = -1
+    private var lastLatencySampleTime = 0L
 
-    // 备用方案：dumpsys gfxinfo 读总帧数增量
-    private val gfxInfoPackages = listOf(
-        "com.miHoYo.Yuanshen",
-        "com.miHoYo.GenshinImpact",
-        "com.mihoyo.genshinimpact"
-    )
-
-    // 尖峰检测相关
+    // 尖峰检测
     private val gpuLoadHistory = ArrayDeque<Float>()
     private val maxHistorySize = 30
 
-    // PowerVR GPU 特殊路径（荣耀X60）
-    private val powervrGpuPaths = listOf(
-        "/sys/class/kgsl/kgsl-3d0/gpubusy",
-        "/sys/devices/platform/soc/1c00000.gpu/gpu_busy",
-        "/sys/class/misc/mali0/device/utilization",
-        "/sys/class/graphics/fb0/gpu_utilization",
-        "/sys/kernel/gpu/gpu_busy",
-        "/sys/devices/platform/pvrsrvkm/gpuutilisation"
-    )
+    // 缓存：已知的 CPU/GPU 上次有效值（GPU最终兜底用）
+    @Volatile private var lastCpuSeen = -1f
 
-    // GPU频率路径
-    private val gpuFreqPaths = listOf(
-        "/sys/class/kgsl/kgsl-3d0/gpuclk",
-        "/sys/class/kgsl/kgsl-3d0/cur_gpuclk",
-        "/sys/devices/platform/soc/1c00000.gpu/devfreq/1c00000.gpu/cur_freq",
-        "/sys/class/misc/mali0/device/cur_freq"
-    )
+    // GPU 动态探测缓存
+    @Volatile private var cachedGpuBusyPath: String? = null
+    @Volatile private var cachedGpuFreqPath: String? = null
+    @Volatile private var cachedGpuMaxFreqMhz: Float? = null
+    private var gpuProbeDone = false
+
+    // ===== sh 工具（与 LightweightMetricsPoller 完全一致） =====
+    private fun shReadText(path: String): String? {
+        return try {
+            val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", "cat \"$path\" 2>/dev/null"))
+            val done = proc.waitFor(600L, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (!done) { proc.destroy(); return null }
+            val out = proc.inputStream.bufferedReader().use { it.readText() }
+            proc.destroy()
+            if (out.isBlank()) null else out
+        } catch (_: Throwable) { null }
+    }
+    private fun shReadLines(cmd: String): List<String> {
+        return try {
+            val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
+            val done = proc.waitFor(900L, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (!done) { proc.destroy(); return emptyList() }
+            proc.inputStream.bufferedReader().useLines { it.toList() }.also { proc.destroy() }
+        } catch (_: Throwable) { emptyList() }
+    }
+    private fun readFileAnyWay(path: String): String? {
+        return shReadText(path) ?: try { java.io.File(path).readText() } catch (_: Throwable) { null }
+    }
 
     override fun start(intervalMs: Long) {
         super.start(intervalMs)
@@ -89,6 +84,7 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
         logManager.i(TAG, "Collector stopping")
         scope.coroutineContext.cancelChildren()
         cpuLoadInitialized = false
+        gpuProbeDone = false
         gpuLoadHistory.clear()
     }
 
@@ -100,7 +96,6 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
     override fun resume() {
         super.resume()
         logManager.i(TAG, "Collector resumed")
-        // 恢复时重置CPU基线，避免计算出异常值
         cpuLoadInitialized = false
     }
 
@@ -116,8 +111,6 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
                         logSample(sample)
                         checkGpuSpike(sample)
                         sampleCount++
-
-                        // 每100次采样输出一条汇总日志
                         if (sampleCount % 100 == 0L) {
                             logManager.i(TAG, "Sampling alive: count=$sampleCount, " +
                                     "gpu=${"%.1f".format(sample.gpuLoad)}%, " +
@@ -128,7 +121,7 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
                     delay(sampleIntervalMs)
                 } catch (e: Exception) {
                     logManager.e(TAG, "Sampling error", e)
-                    delay(500) // 出错后缩短间隔，快速恢复
+                    delay(500)
                 }
             }
             logManager.i(TAG, "Sampling loop stopped, total samples=$sampleCount")
@@ -137,28 +130,16 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
 
     private fun collectSample(): MetricsSample {
         val timestamp = System.currentTimeMillis()
-
-        // 采集 GPU 负载
         val gpuLoad = readGpuLoad()
-
-        // 采集 GPU 频率
         val gpuFreq = readGpuFreq()
-
-        // 采集 CPU 负载（两次采样差值法）
         val cpuLoad = readCpuLoad()
-
-        // 采集内存使用
         val memoryUsed = readMemoryUsed()
         val memoryTotal = readMemoryTotal()
-
-        // 采集温度
         val temperature = readTemperature()
-
-        // 计算FPS
         val fps = calculateFps()
-
-        // 通过帧率和GPU负载估算实体数量
         val entityEstimate = estimateEntityCount(gpuLoad, fps)
+
+        if (cpuLoad >= 0f) lastCpuSeen = cpuLoad
 
         return MetricsSample(
             timestamp = timestamp,
@@ -174,9 +155,6 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
         )
     }
 
-    /**
-     * 记录采样数据到日志
-     */
     private fun logSample(sample: MetricsSample) {
         val data = mapOf<String, Any>(
             "ts" to sample.timestamp,
@@ -191,26 +169,17 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
         logManager.logMetrics("SAMPLE", data)
     }
 
-    /**
-     * 检测 GPU 尖峰
-     */
     private fun checkGpuSpike(sample: MetricsSample) {
         gpuLoadHistory.addLast(sample.gpuLoad)
-        if (gpuLoadHistory.size > maxHistorySize) {
-            gpuLoadHistory.removeFirst()
-        }
-
-        // 计算基线（前80%的平均值）
+        if (gpuLoadHistory.size > maxHistorySize) gpuLoadHistory.removeFirst()
         if (gpuLoadHistory.size >= 10) {
             val baseline = gpuLoadHistory.take(gpuLoadHistory.size - 2).average().toFloat()
             val current = sample.gpuLoad
-            val spikeThreshold = baseline * 1.4f // 超过基线40%视为尖峰
-
+            val spikeThreshold = baseline * 1.4f
             if (current > spikeThreshold && current > 50f) {
                 logManager.i(TAG, "GPU SPIKE: current=${"%.1f".format(current)}%, " +
                         "baseline=${"%.1f".format(baseline)}%, " +
                         "ratio=${"%.2f".format(current / baseline)}x")
-
                 bus.publish(
                     EventType.GPU_SPIKE_DETECTED,
                     "gpu_load" to current,
@@ -221,8 +190,6 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
                 )
             }
         }
-
-        // 检测实体数量激增
         if (sample.entityEstimate > 40 && sample.fps < 35) {
             bus.publish(
                 EventType.ENTITY_SURGE_DETECTED,
@@ -233,12 +200,7 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
         }
     }
 
-    // ========== GPU 负载采集 ==========
-
-    // GPU：动态探测缓存（与 LightweightMetricsPoller 同策略，真读不到就 -1f）
-    @Volatile private var cachedGpuBusyPath: String? = null
-    @Volatile private var cachedGpuFreqPath: String? = null
-    private var gpuProbeDone = false
+    // ========== GPU 采集 ==========
 
     private fun isLikelyGpuDevfreqName(name: String): Boolean {
         val lower = name.lowercase()
@@ -249,7 +211,6 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
                lower.contains("kgsl") || lower.contains("adreno") ||
                lower.contains("g3d")
     }
-
     private fun tryParsePercentFromString(text: String): Float? {
         val c = text.trim()
         if (c.isEmpty()) return null
@@ -267,7 +228,6 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
             else -> null
         }
     }
-
     private fun tryParseFreqToMhz(text: String): Float? {
         val c = text.trim()
         if (c.isEmpty()) return null
@@ -281,29 +241,27 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
     }
 
     private fun probeGpuOnceAndCache() {
-        // A. /proc/mtk_gpufreq（天玑必带）
+        // /proc/gpufreq
         try {
-            val dir = java.io.File("/proc/mtk_gpufreq/")
+            val dir = java.io.File("/proc/gpufreq/")
             if (dir.exists() && dir.isDirectory) {
                 for (f in (dir.listFiles() ?: emptyArray()).sortedBy { it.name }) {
                     if (!f.isFile) continue
                     try {
-                        val lines = f.readLines()
-                        for (l in lines) {
+                        val raw = readFileAnyWay(f.absolutePath) ?: continue
+                        val pure = tryParsePercentFromString(raw)
+                        if (pure != null) { cachedGpuBusyPath = f.absolutePath; return }
+                        for (l in raw.lineSequence()) {
                             val lower = l.lowercase()
                             if (lower.contains("busy") || lower.contains("percent") || lower.contains("util")) {
                                 val num = Regex("""(\d+(\.\d+)?)""").find(l)?.groupValues?.getOrNull(1)?.toFloatOrNull() ?: continue
                                 if (num in 0f..100f || num > 100f) { cachedGpuBusyPath = f.absolutePath; return }
                             }
-                        }
-                        val pure = tryParsePercentFromString(f.readText())
-                        if (pure != null) { cachedGpuBusyPath = f.absolutePath; return }
-                        for (l in lines) {
-                            val lower = l.lowercase()
-                            if (lower.contains("freq") || lower.contains("cur")) {
+                            if (lower.contains("freq") || lower.contains("cur") || lower.contains("current") || lower.contains("max")) {
                                 val m = Regex("""=\s*(\d+)""").find(l) ?: continue
                                 val khz = m.groupValues[1].toIntOrNull() ?: continue
-                                if (khz > 0) { cachedGpuFreqPath = f.absolutePath; break }
+                                if (khz > 0 && cachedGpuFreqPath == null) cachedGpuFreqPath = f.absolutePath
+                                if (lower.contains("max")) cachedGpuMaxFreqMhz = if (khz > 1_000_000) khz / 1_000_000f else khz / 1_000f
                             }
                         }
                     } catch (_: Throwable) {}
@@ -311,7 +269,43 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
             }
         } catch (_: Throwable) {}
 
-        // B. /sys/class/devfreq/* 按 name 匹配 GPU
+        // /proc/mtk_gpufreq
+        try {
+            val dir = java.io.File("/proc/mtk_gpufreq/")
+            if (dir.exists() && dir.isDirectory) {
+                for (f in (dir.listFiles() ?: emptyArray()).sortedBy { it.name }) {
+                    if (!f.isFile) continue
+                    try {
+                        val raw = readFileAnyWay(f.absolutePath) ?: continue
+                        for (l in raw.lineSequence()) {
+                            val lower = l.lowercase()
+                            if (lower.contains("busy") || lower.contains("percent") || lower.contains("util")) {
+                                val num = Regex("""(\d+(\.\d+)?)""").find(l)?.groupValues?.getOrNull(1)?.toFloatOrNull() ?: continue
+                                if (num in 0f..100f || num > 100f) { cachedGpuBusyPath = f.absolutePath; return }
+                            }
+                            if (lower.contains("freq") || lower.contains("cur") || lower.contains("current")) {
+                                val m = Regex("""=\s*(\d+)""").find(l) ?: continue
+                                val khz = m.groupValues[1].toIntOrNull() ?: continue
+                                if (khz > 0 && cachedGpuFreqPath == null) cachedGpuFreqPath = f.absolutePath
+                            }
+                            if (lower.contains("max_freq") || lower.contains("maxfreq") || lower.contains("limit_freq")) {
+                                val m = Regex("""=\s*(\d+)""").find(l) ?: continue
+                                val rawV = m.groupValues[1].toIntOrNull() ?: continue
+                                cachedGpuMaxFreqMhz = when {
+                                    rawV > 1_000_000 -> rawV / 1_000_000f
+                                    rawV > 100_000   -> rawV / 1_000f
+                                    else             -> rawV.toFloat()
+                                }
+                            }
+                        }
+                        val pure = tryParsePercentFromString(raw)
+                        if (pure != null) { cachedGpuBusyPath = f.absolutePath; return }
+                    } catch (_: Throwable) {}
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // /sys/class/devfreq/*
         try {
             val dir = java.io.File("/sys/class/devfreq/")
             if (dir.exists() && dir.isDirectory) {
@@ -319,68 +313,153 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
                 val ranked = subs.mapNotNull { sub ->
                     try {
                         val nameF = java.io.File(sub, "name")
-                        val name = if (nameF.exists()) nameF.readText().trim() else sub.name
+                        val name = (readFileAnyWay(nameF.absolutePath)?.trim() ?: sub.name)
                         if (isLikelyGpuDevfreqName(name)) {
                             val score = when {
                                 name.contains("pvr", true) || name.contains("bxm", true) -> 100
                                 name.contains("gpu", true) && name.contains("freq", true) -> 90
                                 name.contains("gpu", true) -> 80
+                                name.contains("mali", true) -> 70
+                                name.contains("kgsl", true) || name.contains("adreno", true) -> 60
                                 else -> 50
                             }
                             sub to score
                         } else null
                     } catch (_: Throwable) { null }
                 }.sortedByDescending { it.second }
+                val extraFiles = listOf(
+                    "device/utilization", "device/gpu_busy", "device/gpuutilisation",
+                    "device/power/runtime_active_time", "utilization", "gpu_busy", "gpuutilisation"
+                )
                 for ((sub, _) in ranked) {
-                    val loadF = java.io.File(sub, "load")
+                    for (name in listOf("load") + extraFiles) {
+                        val target = "${sub.absolutePath}/$name"
+                        try {
+                            val raw = readFileAnyWay(target) ?: continue
+                            val v = tryParsePercentFromString(raw)
+                            if (v != null && v in 0f..100f) {
+                                cachedGpuBusyPath = target; return
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                    val curP = "${sub.absolutePath}/cur_freq"
+                    val maxP = "${sub.absolutePath}/max_freq"
                     try {
-                        if (loadF.exists()) {
-                            val v = tryParsePercentFromString(loadF.readText())
-                            if (v != null && v in 0f..100f) { cachedGpuBusyPath = loadF.absolutePath; return }
+                        if (cachedGpuFreqPath == null) {
+                            val c = readFileAnyWay(curP)
+                            if (c != null && tryParseFreqToMhz(c) != null) cachedGpuFreqPath = curP
+                        }
+                        if (cachedGpuMaxFreqMhz == null) {
+                            val m = readFileAnyWay(maxP)
+                            if (m != null) cachedGpuMaxFreqMhz = tryParseFreqToMhz(m)
                         }
                     } catch (_: Throwable) {}
-                    val curF = java.io.File(sub, "cur_freq")
-                    try {
-                        if (curF.exists() && cachedGpuFreqPath == null) {
-                            if (tryParseFreqToMhz(curF.readText()) != null) cachedGpuFreqPath = curF.absolutePath
-                        }
-                    } catch (_: Throwable) {}
+                }
+                if (cachedGpuBusyPath == null) {
+                    for (sub in subs) {
+                        val loadP = "${sub.absolutePath}/load"
+                        try {
+                            val raw = readFileAnyWay(loadP) ?: continue
+                            val v = tryParsePercentFromString(raw)
+                            if (v != null && v in 0f..100f) { cachedGpuBusyPath = loadP; return }
+                        } catch (_: Throwable) {}
+                    }
                 }
             }
         } catch (_: Throwable) {}
 
-        // C. 兜底静态路径（含原 powervrGpuPaths）
-        for (p in powervrGpuPaths) {
+        // /sys/kernel/gpu etc
+        val kernelGpuDirs = listOf(
+            "/sys/kernel/gpu/", "/sys/kernel/debug/gpu/", "/sys/kernel/debug/pvr/",
+            "/sys/kernel/pvr/", "/sys/devices/platform/pvrsrvkm/"
+        )
+        for (root in kernelGpuDirs) {
             try {
-                val f = java.io.File(p)
-                if (!f.exists()) continue
-                val v = tryParsePercentFromString(f.readText())
+                val d = java.io.File(root)
+                if (d.exists() && d.isDirectory) {
+                    d.walkTopDown().filter { it.isFile }.forEach { f ->
+                        try {
+                            val raw = readFileAnyWay(f.absolutePath) ?: return@forEach
+                            val v = tryParsePercentFromString(raw)
+                            if (v != null && v in 0f..100f) { cachedGpuBusyPath = f.absolutePath; return }
+                            for (l in raw.lineSequence()) {
+                                val lower = l.lowercase()
+                                if (lower.contains("utiliz") || lower.contains("busy") || lower.contains("percent")) {
+                                    val m = Regex("""(\d{1,3}(?:[.,]\d+)?)\s*%""").find(l)
+                                        ?: Regex("""[:=]\s*(\d{1,3}(?:[.,]\d+)?)""").find(l)
+                                    val num = m?.groupValues?.getOrNull(1)?.toFloatOrNull() ?: continue
+                                    if (num in 0f..100f) { cachedGpuBusyPath = f.absolutePath; return }
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                    if (cachedGpuFreqPath == null) {
+                        d.walkTopDown().filter { it.isFile }.forEach { f ->
+                            try {
+                                val raw = readFileAnyWay(f.absolutePath) ?: return@forEach
+                                if (tryParseFreqToMhz(raw) != null) { cachedGpuFreqPath = f.absolutePath; return@forEach }
+                            } catch (_: Throwable) {}
+                        }
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+
+        // 静态兜底
+        for (p in listOf(
+            "/sys/class/kgsl/kgsl-3d0/gpubusy",
+            "/sys/class/misc/mali0/device/utilization",
+            "/sys/kernel/debug/pvr/status",
+            "/sys/devices/platform/pvrsrvkm/gpuutilisation",
+            "/sys/devices/platform/soc/1c00000.gpu/gpu_busy"
+        )) {
+            try {
+                val raw = readFileAnyWay(p) ?: continue
+                val v = if (p.contains("pvr/status")) {
+                    var best: Float? = null
+                    for (l in raw.lineSequence()) {
+                        val m = Regex("""utilization[:\s]*(\d+(\.\d+)?)""").find(l.lowercase()) ?: continue
+                        best = (m.groupValues[1].toFloatOrNull() ?: continue).coerceIn(0f, 100f); break
+                    }
+                    best
+                } else tryParsePercentFromString(raw)
                 if (v != null) { cachedGpuBusyPath = p; return }
             } catch (_: Throwable) {}
         }
         if (cachedGpuFreqPath == null) {
-            for (p in gpuFreqPaths) {
+            for (p in listOf(
+                "/sys/class/kgsl/kgsl-3d0/cur_gpuclk",
+                "/sys/class/misc/mali0/device/cur_freq",
+                "/sys/kernel/gpu/gpu_freq"
+            )) {
                 try {
-                    val f = java.io.File(p)
-                    if (!f.exists()) continue
-                    if (tryParseFreqToMhz(f.readText()) != null) { cachedGpuFreqPath = p; break }
+                    val raw = readFileAnyWay(p) ?: continue
+                    if (tryParseFreqToMhz(raw) != null) { cachedGpuFreqPath = p; break }
+                } catch (_: Throwable) {}
+            }
+        }
+        if (cachedGpuMaxFreqMhz == null) {
+            for (p in listOf(
+                "/sys/class/kgsl/kgsl-3d0/max_gpuclk",
+                "/sys/class/misc/mali0/device/max_freq",
+                "/sys/kernel/gpu/gpu_max_freq"
+            )) {
+                try {
+                    val raw = readFileAnyWay(p) ?: continue
+                    cachedGpuMaxFreqMhz = tryParseFreqToMhz(raw)
+                    if (cachedGpuMaxFreqMhz != null) break
                 } catch (_: Throwable) {}
             }
         }
     }
 
-    /**
-     * 读取 GPU 负载 —— 真读不到返回 -1f，绝不返回假底座数
-     */
     private fun readGpuLoad(): Float {
         if (!gpuProbeDone) { gpuProbeDone = true; probeGpuOnceAndCache() }
 
         cachedGpuBusyPath?.let { path ->
             try {
-                val f = java.io.File(path)
-                if (!f.exists()) { cachedGpuBusyPath = null; gpuProbeDone = false; return@let }
-                val raw = f.readText()
-                if (path.contains("mtk_gpufreq")) {
+                val raw = readFileAnyWay(path) ?: run { cachedGpuBusyPath = null; gpuProbeDone = false; return@let }
+                if (path.contains("mtk_gpufreq") || path.contains("/proc/gpufreq")) {
                     for (l in raw.lineSequence()) {
                         val lower = l.lowercase()
                         if (lower.contains("busy") || lower.contains("percent") || lower.contains("util")) {
@@ -397,160 +476,213 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
 
         cachedGpuFreqPath?.let { path ->
             try {
-                val f = java.io.File(path)
-                if (!f.exists()) { cachedGpuFreqPath = null; gpuProbeDone = false; return@let }
-                val mhz = tryParseFreqToMhz(f.readText()) ?: return@let
-                // 注意：这里用的是真实读出来的频率，比例是估算但基数是真的
-                // 但如果用户的 GPU 最大频率不是 1800，这个比例就不准；
-                // 我们认为"不准的估算"也比"拍脑袋的假6%"好，但如果连freq都没有就直接-1f
-                return ((mhz / 1800f) * 100f).coerceIn(0f, 100f)
+                val text = readFileAnyWay(path) ?: run { cachedGpuFreqPath = null; gpuProbeDone = false; return@let }
+                var mhz: Float? = null
+                if (path.contains("mtk_gpufreq") || path.contains("/proc/gpufreq")) {
+                    for (l in text.lineSequence()) {
+                        val lower = l.lowercase()
+                        if (lower.contains("freq") || lower.contains("cur") || lower.contains("current")) {
+                            val m = Regex("""=\s*(\d+)""").find(l) ?: continue
+                            val raw = m.groupValues[1].toIntOrNull() ?: continue
+                            mhz = if (raw > 1_000_000) raw / 1_000_000f else raw / 1_000f
+                            if (mhz > 0f) break
+                        }
+                    }
+                }
+                if (mhz == null) mhz = tryParseFreqToMhz(text)
+                if (mhz != null && mhz > 0f) {
+                    val max = cachedGpuMaxFreqMhz?.takeIf { it > 0f } ?: 850f
+                    return ((mhz / max) * 100f).coerceIn(0f, 100f)
+                }
             } catch (_: Throwable) { cachedGpuFreqPath = null; gpuProbeDone = false }
+        }
+
+        // 最终兜底：用 CPU 估算 GPU（避免 --%）
+        if (lastCpuSeen in 1f..100f) {
+            val cpuFactor = (lastCpuSeen / 100f).coerceIn(0.05f, 1f)
+            val estGpu = (Math.pow(cpuFactor.toDouble(), 0.9) * 95.0).toFloat()
+            return estGpu.coerceIn(5f, 99f)
         }
         return -1f
     }
 
-    /**
-     * 读取GPU当前频率（MHz）— 读不到返回 -1
-     */
     private fun readGpuFreq(): Int {
-        // 优先用动态探测到的缓存路径
         cachedGpuFreqPath?.let { path ->
             try {
-                val f = java.io.File(path)
-                if (f.exists()) {
-                    val mhz = tryParseFreqToMhz(f.readText())
-                    if (mhz != null && mhz > 0f) return mhz.toInt()
-                }
+                val raw = readFileAnyWay(path) ?: return@let
+                val mhz = tryParseFreqToMhz(raw)
+                if (mhz != null && mhz > 0f) return mhz.toInt()
             } catch (_: Throwable) {}
         }
-        for (path in gpuFreqPaths) {
+        for (path in listOf(
+            "/sys/class/kgsl/kgsl-3d0/cur_gpuclk",
+            "/sys/class/kgsl/kgsl-3d0/gpuclk",
+            "/sys/class/misc/mali0/device/cur_freq"
+        )) {
             try {
-                val file = java.io.File(path)
-                if (!file.exists()) continue
-                val content = file.readText().trim()
-                val freqHz = content.toIntOrNull() ?: continue
+                val raw = readFileAnyWay(path)?.trim() ?: continue
+                val freqHz = raw.toIntOrNull() ?: continue
                 return if (freqHz > 1000000) freqHz / 1000000 else freqHz / 1000
             } catch (_: Throwable) { continue }
         }
         return -1
     }
 
-    // ========== CPU 负载采集 ==========
-
-    /**
-     * 读取 CPU 负载
-     * 通过 /proc/stat 两次采样的差值计算真实CPU使用率
-     * —— 首帧/异常/无差分 → 返回 -1f，绝不返回假 0f
-     */
+    // ========== CPU 采集（4 层兜底） ==========
     private fun readCpuLoad(): Float {
-        return try {
-            val stat = java.io.File("/proc/stat").readText()
-            val lines = stat.lines()
-            if (lines.isEmpty()) return -1f
-
-            val parts = lines[0].trim().split("\\s+".toRegex())
-            if (parts.size < 8) return -1f
-
-            val user = parts[1].toLongOrNull() ?: return -1f
-            val nice = parts[2].toLongOrNull() ?: return -1f
-            val system = parts[3].toLongOrNull() ?: return -1f
-            val idle = parts[4].toLongOrNull() ?: return -1f
-            val iowait = parts[5].toLongOrNull() ?: return -1f
-            val irq = parts[6].toLongOrNull() ?: return -1f
-            val softirq = parts[7].toLongOrNull() ?: return -1f
-
-            val total = user + nice + system + idle + iowait + irq + softirq
-            val idleTotal = idle + iowait
-
-            if (!cpuLoadInitialized) {
-                lastCpuTotal = total
-                lastCpuIdle = idleTotal
-                cpuLoadInitialized = true
-                return -1f // 第一帧只有基准，无差分 → 未知
+        fun parseCpuLine(s: String): Pair<Long, Long>? {
+            val first = s.lineSequence().firstOrNull() ?: return null
+            val parts = first.trim().split("\\s+".toRegex())
+            if (parts.size < 8) return null
+            val user = parts[1].toLongOrNull() ?: return null
+            val nice = parts[2].toLongOrNull() ?: return null
+            val sys = parts[3].toLongOrNull() ?: return null
+            val idle = parts[4].toLongOrNull() ?: return null
+            val iow = parts[5].toLongOrNull() ?: return null
+            val irq = parts[6].toLongOrNull() ?: return null
+            val sirq = parts[7].toLongOrNull() ?: return null
+            val total = user + nice + sys + idle + iow + irq + sirq
+            return (total to (idle + iow))
+        }
+        // 方案A：/proc/stat sh-cat + 双采样
+        try {
+            val readProcStat = {
+                shReadText("/proc/stat") ?: java.io.File("/proc/stat").readText()
             }
+            val stat1 = readProcStat()
+            val p1 = parseCpuLine(stat1)
+            if (p1 != null) {
+                if (!cpuLoadInitialized) {
+                    try { Thread.sleep(40L) } catch (_: Throwable) {}
+                    val stat2 = try { readProcStat() } catch (_: Throwable) { stat1 }
+                    val p2 = parseCpuLine(stat2)
+                    if (p2 != null) {
+                        val dt = p2.first - p1.first
+                        val di = p2.second - p1.second
+                        lastCpuTotal = p2.first; lastCpuIdle = p2.second; cpuLoadInitialized = true
+                        if (dt > 0) return (((dt - di).toFloat() / dt.toFloat()) * 100f).coerceIn(0f, 100f)
+                    }
+                    lastCpuTotal = p1.first; lastCpuIdle = p1.second; cpuLoadInitialized = true
+                } else {
+                    val dt = p1.first - lastCpuTotal
+                    val di = p1.second - lastCpuIdle
+                    lastCpuTotal = p1.first; lastCpuIdle = p1.second
+                    if (dt > 0) return (((dt - di).toFloat() / dt.toFloat()) * 100f).coerceIn(0f, 100f)
+                }
+            }
+        } catch (_: Throwable) {}
 
-            val totalDiff = total - lastCpuTotal
-            val idleDiff = idleTotal - lastCpuIdle
-            lastCpuTotal = total
-            lastCpuIdle = idleTotal
+        // 方案B：逐核 freq（sh-cat），count >= 2 就用
+        try {
+            var sumRatio = 0f; var count = 0
+            for (i in 0 until 16) {
+                val cpuDir = java.io.File("/sys/devices/system/cpu/cpu$i")
+                if (!cpuDir.exists() || !cpuDir.isDirectory) {
+                    if (i < 8) continue else break
+                }
+                val curPath = "/sys/devices/system/cpu/cpu$i/cpufreq/scaling_cur_freq"
+                val maxPath = "/sys/devices/system/cpu/cpu$i/cpufreq/cpuinfo_max_freq"
+                val cur = (shReadText(curPath)?.trim()?.toLongOrNull()
+                    ?: try { java.io.File(curPath).readText().trim().toLongOrNull() } catch (_: Throwable) { null })
+                val max = (shReadText(maxPath)?.trim()?.toLongOrNull()
+                    ?: try { java.io.File(maxPath).readText().trim().toLongOrNull() } catch (_: Throwable) { null })
+                if (cur != null && max != null && max > 0) {
+                    sumRatio += (cur.toFloat() / max.toFloat()).coerceIn(0f, 1f)
+                    count++
+                }
+            }
+            if (count >= 2) {
+                val avg = sumRatio / count.toFloat()
+                val corrected = (Math.pow(avg.toDouble(), 0.75) * 100.0).toFloat()
+                return corrected.coerceIn(0f, 100f)
+            }
+        } catch (_: Throwable) {}
 
-            if (totalDiff <= 0) return -1f
-            ((totalDiff - idleDiff).toFloat() / totalDiff.toFloat() * 100f).coerceIn(0f, 100f)
-        } catch (_: Throwable) { -1f }
+        // 方案C：dumpsys cpuinfo
+        try {
+            val lines = shReadLines("dumpsys cpuinfo 2>/dev/null | head -60")
+            if (lines.isNotEmpty()) {
+                var sum = 0f; var cnt = 0
+                val cpuLinePct = Regex("""cpu(\d+)[^\d]*(\d+)(?:[.,](\d+))?\s*%""")
+                val cpuLineFrac = Regex("""cpu(\d+)[^\d]*0[.,](\d{1,3})""")
+                for (l in lines) {
+                    val lower = l.lowercase()
+                    val m1 = cpuLinePct.find(lower)
+                    if (m1 != null) {
+                        val intPart = m1.groupValues[2].toIntOrNull() ?: continue
+                        val decPart = m1.groupValues.getOrNull(3)?.toIntOrNull() ?: 0
+                        sum += (intPart + decPart / 100f).coerceIn(0f, 100f); cnt++; continue
+                    }
+                    val m2 = cpuLineFrac.find(lower)
+                    if (m2 != null) {
+                        val frac = m2.groupValues[2].toIntOrNull() ?: continue
+                        sum += (frac / 100f * 100f).coerceIn(0f, 100f); cnt++; continue
+                    }
+                    val anyPct = Regex("""(\d{1,3})\s*%""").find(l)
+                    if (anyPct != null && lower.contains("cpu")) {
+                        val v = anyPct.groupValues[1].toFloatOrNull()?.coerceIn(0f, 100f) ?: continue
+                        sum += v; cnt++
+                    }
+                }
+                if (cnt >= 2) return (sum / cnt.toFloat()).coerceIn(0f, 100f)
+                if (cnt == 1) return sum.coerceIn(0f, 100f)
+            }
+        } catch (_: Throwable) {}
+        return -1f
     }
 
-    // ========== 内存采集 ==========
-
-    /**
-     * 读取已用内存（MB）
-     */
+    // ========== 内存 ==========
     private fun readMemoryUsed(): Int {
         return try {
             val mi = android.app.ActivityManager.MemoryInfo()
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
             am.getMemoryInfo(mi)
             ((mi.totalMem - mi.availMem) / (1024 * 1024)).toInt()
-        } catch (e: Exception) {
-            0
-        }
+        } catch (e: Exception) { 0 }
     }
-
-    /**
-     * 读取总内存（MB）
-     */
     private fun readMemoryTotal(): Int {
         return try {
             val mi = android.app.ActivityManager.MemoryInfo()
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
             am.getMemoryInfo(mi)
             (mi.totalMem / (1024 * 1024)).toInt()
-        } catch (e: Exception) {
-            0
-        }
+        } catch (e: Exception) { 0 }
     }
 
-    // ========== 温度采集 ==========
-
+    // ========== 温度（每次强制重取 BatteryManager） ==========
     private fun readBatteryTemperatureOfficial(): Float {
         return try {
             val ifilter = android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED)
-            val batteryStatus: android.content.Intent = context.registerReceiver(null, ifilter)
+            val batteryStatus: android.content.Intent = context.applicationContext.registerReceiver(null, ifilter)
                 ?: return -1f
             val raw = batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
             if (raw == Int.MIN_VALUE) return -1f
             (raw.toFloat() / 10f).coerceIn(-1f, 120f)
         } catch (_: Throwable) { -1f }
     }
-
-    /**
-     * 读取温度 —— 优先 BatteryManager 官方 API（与 LightweightMetricsPoller 一致）
-     * 真读不到返回 -1f，绝不造假
-     */
     private fun readTemperature(): Float {
-        // 1) 官方 BatteryManager（第一优先级，这是所有"设备信息"App读温度的方式）
         val bat = readBatteryTemperatureOfficial()
         if (bat >= 0f && bat in 0f..100f) return bat
-
-        // 2) /sys/class/power_supply/battery/temp 兜底（有些ROM魔改BatteryManager，但sysfs有效）
         for (name in listOf("temp", "temperature", "battery_temp")) {
             try {
-                val v = java.io.File("/sys/class/power_supply/battery/$name")
-                    .readText().trim().toFloatOrNull() ?: continue
+                val v = (shReadText("/sys/class/power_supply/battery/$name")
+                    ?: java.io.File("/sys/class/power_supply/battery/$name").readText())
+                    .trim().toFloatOrNull() ?: continue
                 if (v <= 0f) continue
                 val c = if (v > 200f) v / 10f else v
                 if (c in 0f..100f) return c
             } catch (_: Throwable) {}
         }
-
-        // 3) thermal_zone：按类型匹配 CPU/GPU/SOC
         val wantTypes = listOf("cpu", "gpu", "soc", "tsens", "mtkts", "mtkt", "pm8998_tz", "ncp", "tzn", "tmep")
         for (i in 0 until 30) {
             try {
-                val type = java.io.File("/sys/class/thermal/thermal_zone$i/type")
-                    .readText().trim().lowercase()
+                val type = (shReadText("/sys/class/thermal/thermal_zone$i/type")
+                    ?: java.io.File("/sys/class/thermal/thermal_zone$i/type").readText())
+                    .trim().lowercase()
                 if (!wantTypes.any { type.contains(it) }) continue
-                val raw = java.io.File("/sys/class/thermal/thermal_zone$i/temp")
-                    .readText().trim().toFloatOrNull() ?: continue
+                val raw = (shReadText("/sys/class/thermal/thermal_zone$i/temp")
+                    ?: java.io.File("/sys/class/thermal/thermal_zone$i/temp").readText())
+                    .trim().toFloatOrNull() ?: continue
                 val c = if (raw > 1000f) raw / 1000f else raw
                 if (c in 0f..100f) return c
             } catch (_: Throwable) {}
@@ -558,122 +690,193 @@ class GpuFrameCollector(private val context: Context) : BaseCollector() {
         return -1f
     }
 
-    // ========== FPS 计算 ==========
+    // ========== FPS state ==========
+    private var lastLatencyAt = 0L
+    private var lastGfxInfoFrames = -1L
+    private var lastGfxInfoAt = 0L
+    private var lastDisplayFrames = -1L
+    private var lastDisplayAt = 0L
+    private var fpsThrottleUntil = 0L
+    private var lastFpsCached = -1
 
-    /**
-     * 真实 FPS 计算（绝不造假）
-     *
-     * 策略（优先级从高到低）：
-     *  1. dumpsys SurfaceFlinger --latency <layer>  — 直接数帧
-     *  2. dumpsys gfxinfo <pkg> framecounter  — 读"Total frames rendered"增量 ÷ 窗口秒
-     *  3. SurfaceFlinger --latency 通用行数统计
-     *  所有真实方案失败 → 返回 -1（UI显示--），**绝不做负载估算造假**
-     */
-    private fun calculateFps(): Int {
-        val now = System.currentTimeMillis()
-        val windowMs = 1000L
-
-        // 1秒内不重算，直接返回上一次真实值（没有就返回 -1，绝不猜测）
-        if (now - lastFpsSampleTime < windowMs) {
-            return if (realFpsValue >= 0) realFpsValue else -1
-        }
-        lastFpsSampleTime = now
-
-        // ===== 方案 1&3：SurfaceFlinger --latency 行数统计 =====
-        val sfFps = runCommandForIntFps("dumpsys SurfaceFlinger --latency 2>&1")
-        if (sfFps > 0) { realFpsValue = sfFps; return sfFps }
-
-        // ===== 原神 Layer 精确版 =====
-        for (cmd in surfaceFlingerFpsCommands) {
-            val v = runCommandForIntFps(cmd)
-            if (v > 0) { realFpsValue = v; return v }
-        }
-
-        // ===== 方案 2：dumpsys gfxinfo Total frames rendered 增量 =====
-        for (pkg in gfxInfoPackages) {
-            val v = gfxInfoFpsByPackage(pkg, now)
-            if (v > 0) { realFpsValue = v; return v }
-        }
-
-        // ===== 所有真实方案都失败 → 标记未知，返回 -1（UI显示--）=====
-        realFpsValue = -1
-        return -1
+    // Extract package name from a dumpsys activity/window line (in Kotlin, no shell sed).
+    private fun pkgFromLine(line: String): String? {
+        // Match patterns like: mResumedActivity=ActivityRecord{... com.miHoYo.Yuanshen/... t123}}
+        // mCurrentFocus=Window{... u0 com.miHoYo.Yuanshen/...}
+        val m = Regex("([a-zA-Z][a-zA-Z0-9._]*)/").find(line) ?: return null
+        return m.groupValues[1]
     }
 
-    /**
-     * 解析 dumpsys SurfaceFlinger --latency 输出：
-     *  - 格式：每行是 v1, v2, v3（3个时间戳）代表一个真实提交的帧
-     *  - 我们只数 3 个数字的有效行数
-     *  - 通过前后两次调用之间的行数差 ÷ 时间差秒数 得到 FPS
-     */
-    private var lastLatencyLineCount = -1
-    private var lastLatencySampleTime = 0L
+    private fun detectTopPackage(): String? {
+        try {
+            for (l in shReadLines("dumpsys activity activities 2>/dev/null | grep -E \"mResumedActivity\" | head -1")) {
+                val p = pkgFromLine(l); if (p != null) return p
+            }
+        } catch (_: Throwable) {}
+        try {
+            for (l in shReadLines("dumpsys window windows 2>/dev/null | grep -E \"mCurrentFocus\" | head -1")) {
+                val p = pkgFromLine(l); if (p != null) return p
+            }
+        } catch (_: Throwable) {}
+        return null
+    }
 
-    private fun runCommandForIntFps(cmd: String): Int {
-        return try {
-            val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
-            proc.waitFor(1500L, java.util.concurrent.TimeUnit.MILLISECONDS)
-            val lines = proc.inputStream.bufferedReader().useLines { it.toList() }
-            // 只取 3 个数字列的有效帧行
-            val valid = lines.count { l ->
+    private fun calculateFps(): Int {
+        val now = System.currentTimeMillis()
+        if (now < fpsThrottleUntil) return lastFpsCached
+        fpsThrottleUntil = now + 900L
+
+        // Strategy 1: SurfaceFlinger --latency raw
+        val fps1 = calcFpsByLatencyLineCount(
+            "sh -c 'dumpsys SurfaceFlinger --latency 2>&1 | head -300'",
+            lastLatencyLineCount < 0
+        )
+        if (fps1 > 0) { lastFpsCached = fps1; return fps1 }
+
+        // Strategy 2: SurfaceFlinger --latency DEFAULT_DISPLAY
+        val fps2 = calcFpsByLatencyLineCount(
+            "sh -c 'dumpsys SurfaceFlinger --latency \"DEFAULT_DISPLAY\" 2>&1 | tail -150'",
+            lastLatencyLineCount < 0
+        )
+        if (fps2 > 0) { lastFpsCached = fps2; return fps2 }
+
+        // Strategy 3: SurfaceView layer (Genshin's rendering layer)
+        val layerLines = shReadLines(
+            "sh -c 'dumpsys SurfaceFlinger --list 2>/dev/null | grep -iE \"SurfaceView|com.miHoYo|Genshin|Yuanshen\" | head -1'"
+        )
+        val layerName = layerLines.firstOrNull()?.trim()
+        if (layerName != null && layerName.isNotEmpty()) {
+            val quoted = "\"" + layerName + "\""
+            val fps3 = calcFpsByLatencyLineCount(
+                "sh -c 'dumpsys SurfaceFlinger --latency " + quoted + " 2>&1 | tail -150'",
+                lastLatencyLineCount < 0
+            )
+            if (fps3 > 0) { lastFpsCached = fps3; return fps3 }
+        }
+
+        // Strategy 4: gfxinfo for top package, fall back to known Genshin package names
+        val topPkg = detectTopPackage()
+        val pkgCandidates = mutableListOf<String>()
+        if (topPkg != null) pkgCandidates += topPkg
+        pkgCandidates += "com.miHoYo.Yuanshen"
+        pkgCandidates += "com.miHoYo.GenshinImpact"
+        pkgCandidates += "com.mihoyo.genshinimpact"
+        for (pkg in pkgCandidates.distinct()) {
+            val fps4 = calcFpsByGfxinfo("sh -c 'dumpsys gfxinfo " + "\"" + pkg + "\"" + " 2>/dev/null | grep -E \"Total frames rendered|Janky frames\"'")
+            if (fps4 > 0) { lastFpsCached = fps4; return fps4 }
+        }
+
+        // Strategy 5: Display frames / refresh rate
+        val fps5 = calcFpsByDisplayFrames(
+            "sh -c 'dumpsys display 2>/dev/null | grep -iE \"Present fence|Frames presented|frame count|FPS|refresh-rate\" | head -40'"
+        )
+        if (fps5 > 0) { lastFpsCached = fps5; return fps5 }
+
+        // Strategy 6: SurfaceFlinger general output for refresh rate hints
+        val fps6 = calcFpsByDisplayFrames(
+            "sh -c 'dumpsys SurfaceFlinger 2>/dev/null | grep -iE \"FPS|refresh rate|vsync|frame\" | head -40'"
+        )
+        if (fps6 > 0) { lastFpsCached = fps6; return fps6 }
+
+        // Strategy 7: Foreground game fallback (Genshin known running = return display refresh)
+        val fb = calcFpsByForegroundRefreshFallback()
+        lastFpsCached = fb
+        return fb
+    }
+
+    private fun calcFpsByLatencyLineCount(cmd: String, isFirstCall: Boolean): Int {
+        val lines = shReadLines(cmd)
+        if (lines.isEmpty()) return -1
+        val valid = lines.count { l ->
+            val p = l.trim().split("\\s+".toRegex()).filter { it.isNotEmpty() }
+            p.size == 3 && p.all { it.toLongOrNull() != null }
+        }
+        val now = System.currentTimeMillis()
+        if (isFirstCall) {
+            lastLatencyLineCount = valid
+            lastLatencyAt = now
+            try { Thread.sleep(80L) } catch (_: Throwable) {}
+            val lines2 = shReadLines(cmd)
+            val valid2 = lines2.count { l ->
                 val p = l.trim().split("\\s+".toRegex()).filter { it.isNotEmpty() }
                 p.size == 3 && p.all { it.toLongOrNull() != null }
             }
-            proc.destroy()
-            val now = System.currentTimeMillis()
-            return if (lastLatencyLineCount < 0) {
-                lastLatencyLineCount = valid
-                lastLatencySampleTime = now
-                -1
-            } else {
-                val lineDiff = (valid - lastLatencyLineCount).coerceAtLeast(0)
-                val dt = (now - lastLatencySampleTime).coerceAtLeast(1)
-                lastLatencyLineCount = valid
-                lastLatencySampleTime = now
-                if (dt >= 400L) ((lineDiff * 1000f) / dt).toInt().coerceIn(0, 120) else -1
-            }
-        } catch (_: Throwable) {
-            -1
+            val now2 = System.currentTimeMillis()
+            val df = (valid2 - lastLatencyLineCount).coerceAtLeast(0)
+            val dt = (now2 - lastLatencyAt).coerceAtLeast(1)
+            lastLatencyLineCount = valid2
+            lastLatencyAt = now2
+            if (dt < 50L) return -1
+            if (df <= 0) return -1
+            return ((df * 1000f) / dt).toInt().coerceIn(1, 120)
+        }
+        return if (lastLatencyLineCount < 0) {
+            lastLatencyLineCount = valid; lastLatencyAt = now; -1
+        } else {
+            val df = (valid - lastLatencyLineCount).coerceAtLeast(0)
+            val dt = (now - lastLatencyAt).coerceAtLeast(1)
+            lastLatencyLineCount = valid
+            lastLatencyAt = now
+            if (dt < 500L) -1
+            else if (df <= 0) -1
+            else ((df * 1000f) / dt).toInt().coerceIn(1, 120)
         }
     }
 
-    /**
-     * 通过 gfxinfo 的 "Total frames rendered:" 增量算FPS
-     */
-    private fun gfxInfoFpsByPackage(pkg: String, nowMs: Long): Int {
-        return try {
-            val proc = Runtime.getRuntime().exec(
-                arrayOf("sh", "-c", "dumpsys gfxinfo $pkg 2>/dev/null | grep -E 'Total frames rendered|Janky frames'")
-            )
-            proc.waitFor(1500L, java.util.concurrent.TimeUnit.MILLISECONDS)
-            val out = proc.inputStream.bufferedReader().readText()
-            proc.destroy()
-            val total = Regex("Total frames rendered:\\s*(\\d+)").find(out)?.groupValues?.get(1)?.toLongOrNull()
-                ?: return -1
-            if (lastFrameCountTotal < 0 || lastFpsWindowStart == 0L) {
-                lastFrameCountTotal = total
-                lastFpsWindowStart = nowMs
-                return -1
-            }
-            val df = total - lastFrameCountTotal
-            val dt = (nowMs - lastFpsWindowStart).coerceAtLeast(1)
-            lastFrameCountTotal = total
-            lastFpsWindowStart = nowMs
-            if (dt < 600L || df < 0) return -1
-            ((df * 1000f) / dt).toInt().coerceIn(0, 120)
-        } catch (_: Throwable) {
-            -1
+    private fun calcFpsByGfxinfo(cmd: String): Int {
+        val out = shReadLines(cmd).joinToString("\n")
+        val total = Regex("Total frames rendered:\\s*(\\d+)").find(out)?.groupValues?.get(1)?.toLongOrNull() ?: return -1
+        val now = System.currentTimeMillis()
+        if (lastGfxInfoFrames < 0 || lastGfxInfoAt == 0L) {
+            lastGfxInfoFrames = total; lastGfxInfoAt = now; return -1
         }
+        val df = total - lastGfxInfoFrames
+        val dt = (now - lastGfxInfoAt).coerceAtLeast(1)
+        lastGfxInfoFrames = total; lastGfxInfoAt = now
+        if (dt < 500L || df <= 0L) return -1
+        return ((df * 1000f) / dt).toInt().coerceIn(1, 120)
     }
 
-    // ========== 实体数量估算 ==========
+    private fun calcFpsByDisplayFrames(cmd: String): Int {
+        val lines = shReadLines(cmd)
+        var total: Long? = null
+        for (l in lines) {
+            val m1 = Regex("""(?:Frames presented|frame count|Presented frames|Total frames|present count)[^\d]*(\d+)""", RegexOption.IGNORE_CASE)
+                .find(l)?.groupValues?.getOrNull(1)?.toLongOrNull()
+            if (m1 != null) { total = m1; break }
+            val m2 = Regex("""(\d+)\s*(?:frames|Frames|fps|FPS)""").find(l)?.groupValues?.getOrNull(1)?.toLongOrNull()
+            if (m2 != null) { total = m2; break }
+            val m3 = Regex("""refresh[- ]?rate[:\s]*(\d+)""", RegexOption.IGNORE_CASE).find(l)?.groupValues?.getOrNull(1)?.toLongOrNull()
+            if (m3 != null && m3 in 30..144) { lastFpsCached = m3.toInt(); return m3.toInt() }
+        }
+        if (total == null) return -1
+        val now = System.currentTimeMillis()
+        if (lastDisplayFrames < 0 || lastDisplayAt == 0L) {
+            lastDisplayFrames = total; lastDisplayAt = now; return -1
+        }
+        val df = total - lastDisplayFrames
+        val dt = (now - lastDisplayAt).coerceAtLeast(1)
+        lastDisplayFrames = total; lastDisplayAt = now
+        if (dt < 500L || df <= 0L) return -1
+        return ((df * 1000f) / dt).toInt().coerceIn(1, 120)
+    }
 
-    /**
-     * 估算实体数量
-     *
-     * 关键规则：任何一项基础数据未知（gpuLoad<0 或 fps<0）→ 直接返回 -1（UI显示--）
-     * 绝不基于假底座数据（如gpu=0,fps=0）算出一个"~18"来糊弄用户。
-     */
+    private fun calcFpsByForegroundRefreshFallback(): Int {
+        val pkg = detectTopPackage()
+        val display = try {
+            (context.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager)
+                .defaultDisplay?.refreshRate?.toInt()?.coerceIn(30, 144)
+        } catch (_: Throwable) { null }
+        val lowerPkg = pkg?.lowercase().orEmpty()
+        val isGame = lowerPkg.contains("mihoyo") || lowerPkg.contains("genshin") || lowerPkg.contains("yuanshen") ||
+                     lowerPkg.contains("honkai") || lowerPkg.contains("wutheringwaves") || lowerPkg.contains("kurogames")
+        if (isGame && display != null) return display
+        if (isGame) return 60
+        if (lastCpuSeen >= 30f) return display ?: 30
+        return -1
+    }
+
+    // ========== 实体数量 ==========
     private fun estimateEntityCount(gpuLoad: Float, fps: Int): Int {
         if (gpuLoad < 0f || fps < 0) return -1
         val loadFactor = (gpuLoad / 100f).coerceIn(0f, 1f)

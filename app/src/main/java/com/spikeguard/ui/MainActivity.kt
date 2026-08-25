@@ -501,6 +501,12 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 启动守护服务
+     *
+     * 修复关键竞态：不要一启动服务就立刻停本地poller！
+     * 服务还在"启动中..."时，SERVICE_STARTED广播 + 首条METRICS_SAMPLE广播都还没到，
+     * 提前停poller会让这段"真空期"UI完全失去数据源（用户截图里还停在启动中就是这个情况）。
+     * 正确动作：只等 SERVICE_STARTED 到达后，再停掉本地 poller。
+     * 再加超时保护：8秒内服务还没起来 → 自动重启本地poller，避免永久无数据。
      */
     private fun startGuardService() {
         try {
@@ -516,11 +522,25 @@ class MainActivity : AppCompatActivity() {
             tvStatus.text = "启动中..."
             btnStart.isEnabled = false
             btnStop.isEnabled = true
-            // 既然准备让服务接管数据了，本地先停掉（避免双重耗电）
-            stopLocalPoller()
+            // ==== 关键修复：本地poller不停，继续采集。等SERVICE_STARTED真的来了再停。====
+            // 避免"启动中..."期间丢失CPU/GPU/温度/FPS所有刷新
+            ensureLocalPollerStarted()
+
+            // 超时保护：8秒后若还没收到 SERVICE_STARTED，认为服务启动失败，UI继续依赖本地poller
+            val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+            mainHandler.postDelayed({
+                if (tvStatus.text?.startsWith("启动中") == true) {
+                    tvStatus.text = "启动超时（本地监控继续）"
+                    btnStart.isEnabled = true
+                    btnStop.isEnabled = false
+                    serviceRunning = false
+                    startLocalPoller()
+                }
+            }, 8000L)
         } catch (e: Exception) {
             tvStatus.text = "启动失败: ${e.message}"
-            // 失败就把本地采样重新拉回来
+            btnStart.isEnabled = true
+            btnStop.isEnabled = false
             startLocalPoller()
         }
     }
@@ -539,11 +559,15 @@ class MainActivity : AppCompatActivity() {
             tvStatus.setTextColor(getColor(R.color.stopped))
             btnStart.isEnabled = true
             btnStop.isEnabled = false
-            // 服务停了，UI 实时数据不应该停 —— 启动本地轮询
+            // 立刻拉起本地poller，不等 stopped 广播，避免真空期
             startLocalPoller()
         } catch (e: Exception) {
             tvStatus.text = "停止失败: ${e.message}"
         }
+    }
+
+    private fun ensureLocalPollerStarted() {
+        if (localPoller == null) startLocalPoller()
     }
 
     /**
