@@ -24,8 +24,14 @@ class UiStateBridge(private val context: Context) {
      * 启动桥接：订阅服务进程事件，转为广播发出
      */
     fun start() {
-        // 转发UI状态更新
+        // 转发UI状态更新（决策引擎每采样一次发的，含风险等级和保护状态）
         bus.subscribe(EventType.UI_STATE_UPDATE) { event ->
+            broadcastUiState(event.data)
+        }
+
+        // ===== 关键补充：转发 METRICS_SAMPLE（采集器原始采样，高频 & 无权限依赖也能读 CPU/GPU/温度）
+        // 当 UI_STATE_UPDATE 没来得及或被 silentMode 跳过时，这个也能保证 UI 有数据
+        bus.subscribe(EventType.METRICS_SAMPLE) { event ->
             broadcastUiState(event.data)
         }
 
