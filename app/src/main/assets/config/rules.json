@@ -8,6 +8,33 @@
     "protection_window_ms": 1500,
     "fade_out_ms": 200
   },
+  "pseudo_cerebellum": {
+    "enabled": false,
+    "description": "伪小脑（一加一减·刚柔并济）系统：监测算力尖峰→任务排队分流→资源缓冲隔离→异常兜底保护。不删除任何贴图/模型，只疏导任务时序。",
+    "spike_monitor": {
+      "gpu_spike_threshold": 25,
+      "memory_surge_threshold_mb": 200,
+      "spike_window_ms": 300,
+      "sustained_load_threshold": 80
+    },
+    "task_scheduler": {
+      "max_queue_size": 100,
+      "min_submit_rate": 0.1,
+      "max_submit_rate": 1.0,
+      "batch_interval_ms": 100
+    },
+    "resource_buffer": {
+      "min_free_kbytes": 8192,
+      "swappiness": 10,
+      "max_cache_size": 50
+    },
+    "fallback_guard": {
+      "oom_threshold": 0.92,
+      "thermal_threshold": 58,
+      "gpu_critical_threshold": 95,
+      "recovery_check_interval_ms": 1000
+    }
+  },
   "protection_flow": {
     "steps": [
       "detect_battle_settlement",

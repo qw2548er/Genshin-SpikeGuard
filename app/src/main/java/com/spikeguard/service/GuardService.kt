@@ -20,6 +20,7 @@ import com.spikeguard.core.MessageBus
 import com.spikeguard.core.UiStateBridge
 import com.spikeguard.decision.DecisionEngine
 import com.spikeguard.executor.ExecutionManager
+import com.spikeguard.pseudocerebellum.PseudoCerebellum
 import com.spikeguard.util.LogManager
 
 /**
@@ -41,6 +42,7 @@ class GuardService : Service() {
     private lateinit var decisionEngine: DecisionEngine
     private lateinit var executionManager: ExecutionManager
     private lateinit var uiStateBridge: UiStateBridge
+    private lateinit var pseudoCerebellum: PseudoCerebellum
 
     // 心跳使用主线程（轻量操作）
     private var heartbeatHandler = Handler(android.os.Looper.getMainLooper())
@@ -283,6 +285,14 @@ class GuardService : Service() {
         uiStateBridge = UiStateBridge(this)
         uiStateBridge.start()
 
+        // 启动伪小脑（如果配置启用）
+        if (configManager.isPseudoCerebellumEnabled()) {
+            pseudoCerebellum = PseudoCerebellum.getInstance(this)
+            pseudoCerebellum.setEnabled(true)
+            pseudoCerebellum.startMonitor()
+            Log.i(TAG, "PseudoCerebellum started with config")
+        }
+
         updateNotification("运行中 - 保护已启用")
     }
 
@@ -292,6 +302,14 @@ class GuardService : Service() {
     private fun stopModules() {
         collector.stop()
         executionManager.stop()
+        // 停止伪小脑
+        try {
+            if (::pseudoCerebellum.isInitialized) {
+                pseudoCerebellum.stopMonitor()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to stop pseudo cerebellum", e)
+        }
     }
 
     /**

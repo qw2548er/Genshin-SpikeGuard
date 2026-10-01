@@ -275,6 +275,77 @@ class ConfigManager(private val context: Context) {
         }
     }
 
+    // ==================== 伪小脑配置 ====================
+
+    /**
+     * 伪小脑是否启用
+     */
+    fun isPseudoCerebellumEnabled(): Boolean {
+        return try {
+            config.getJSONObject("pseudo_cerebellum").getBoolean("enabled")
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 设置伪小脑开关
+     */
+    fun setPseudoCerebellumEnabled(enabled: Boolean) {
+        try {
+            val pc = config.optJSONObject("pseudo_cerebellum") ?: org.json.JSONObject()
+            pc.put("enabled", enabled)
+            config.put("pseudo_cerebellum", pc)
+            saveConfig()
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Failed to set pseudo cerebellum enabled", e)
+        }
+    }
+
+    /**
+     * 获取伪小脑尖峰监测配置
+     */
+    fun getPseudoCerebellumSpikeConfig(): org.json.JSONObject {
+        return try {
+            config.getJSONObject("pseudo_cerebellum").getJSONObject("spike_monitor")
+        } catch (e: Exception) {
+            org.json.JSONObject()
+        }
+    }
+
+    /**
+     * 获取伪小脑任务调度配置
+     */
+    fun getPseudoCerebellumSchedulerConfig(): org.json.JSONObject {
+        return try {
+            config.getJSONObject("pseudo_cerebellum").getJSONObject("task_scheduler")
+        } catch (e: Exception) {
+            org.json.JSONObject()
+        }
+    }
+
+    /**
+     * 获取伪小脑资源缓冲配置
+     */
+    fun getPseudoCerebellumBufferConfig(): org.json.JSONObject {
+        return try {
+            config.getJSONObject("pseudo_cerebellum").getJSONObject("resource_buffer")
+        } catch (e: Exception) {
+            org.json.JSONObject()
+        }
+    }
+
+    /**
+     * 获取伪小脑兜底保护配置
+     */
+    fun getPseudoCerebellumFallbackConfig(): org.json.JSONObject {
+        return try {
+            config.getJSONObject("pseudo_cerebellum").getJSONObject("fallback_guard")
+        } catch (e: Exception) {
+            org.json.JSONObject()
+        }
+    }
+
     /**
      * 获取日志配置
      */

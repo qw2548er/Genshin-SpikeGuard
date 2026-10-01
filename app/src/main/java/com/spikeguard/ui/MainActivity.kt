@@ -44,6 +44,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchPermission: Switch
     private lateinit var switchAutoStart: Switch
     private lateinit var switchFloatingWindow: Switch
+    private lateinit var switchPseudoCerebellum: Switch
     private lateinit var btnExportConfig: Button
     private lateinit var btnImportConfig: Button
     private lateinit var btnExportLog: Button
@@ -100,6 +101,7 @@ class MainActivity : AppCompatActivity() {
         switchPermission = findViewById(R.id.switchPermission)
         switchAutoStart = findViewById(R.id.switchAutoStart)
         switchFloatingWindow = findViewById(R.id.switchFloatingWindow)
+        switchPseudoCerebellum = findViewById(R.id.switchPseudoCerebellum)
         btnExportConfig = findViewById(R.id.btnExportConfig)
         btnImportConfig = findViewById(R.id.btnImportConfig)
         btnExportLog = findViewById(R.id.btnExportLog)
@@ -136,6 +138,23 @@ class MainActivity : AppCompatActivity() {
 
         switchFloatingWindow.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked) checkAndShowFloatingWindow() else stopFloatingWindow()
+        }
+
+        // 伪小脑总开关
+        switchPseudoCerebellum.setOnCheckedChangeListener { _, isChecked ->
+            configManager.setPseudoCerebellumEnabled(isChecked)
+            // 如果服务正在运行，重启以应用伪小脑设置
+            if (serviceRunning) {
+                val intent = Intent(this, GuardService::class.java).apply {
+                    action = GuardService.ACTION_RESTART
+                }
+                startService(intent)
+            }
+            Toast.makeText(
+                this,
+                if (isChecked) "伪小脑已启用" else "伪小脑已禁用",
+                Toast.LENGTH_SHORT
+            ).show()
         }
 
         btnExportConfig.setOnClickListener { exportConfig() }
@@ -348,8 +367,14 @@ class MainActivity : AppCompatActivity() {
     private fun loadSettings() {
         val prefs = getSharedPreferences("spikeguard_prefs", MODE_PRIVATE)
         switchAutoStart.isChecked = prefs.getBoolean("auto_start", false)
+
+        // 加载运行模式
         switchMode.isChecked = configManager.getRunMode() == RunMode.FULL_PROTECT
+        // 加载权限模式
         switchPermission.isChecked = configManager.getPermissionMode() == PermissionMode.ROOT
+        // 加载伪小脑开关状态
+        switchPseudoCerebellum.isChecked = configManager.isPseudoCerebellumEnabled()
+
         updateModeDisplay()
         updatePermissionDisplay()
     }
