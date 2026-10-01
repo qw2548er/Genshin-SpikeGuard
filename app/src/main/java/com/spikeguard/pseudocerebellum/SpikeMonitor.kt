@@ -27,7 +27,7 @@ import kotlin.math.abs
  * - CPU: /proc/stat 两次采样差值
  * - GPU: /sys 下多种GPU sysfs节点（PowerVR/Adreno/Mali）
  * - 内存: ActivityManager.MemoryInfo + /proc/meminfo
- * - 温度: /sys/class/thermal/thermal_zone*/temp
+ * - 温度: /sys/class/thermal/thermal_zoneX/temp
  */
 class SpikeMonitor(
     private val context: Context,
@@ -68,8 +68,8 @@ class SpikeMonitor(
     private var sustainedLoadThreshold = 80f // 持续高负载阈值（%）
 
     // 订阅现有采集器的METRICS_SAMPLE事件
-    private val metricsCallback: (GuardEvent) -> Unit = { event ->
-        if (!running) return@let
+    private val metricsCallback: (GuardEvent) -> Unit = callback@{ event ->
+        if (!running) return@callback
         val gpuLoad = event.data["gpu_load"] as? Float ?: 0f
         val cpuLoad = event.data["cpu_load"] as? Float ?: 0f
         val memoryUsed = event.data["memory_used_mb"] as? Int ?: 0
