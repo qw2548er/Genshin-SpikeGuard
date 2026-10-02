@@ -162,10 +162,22 @@ class MainActivity : AppCompatActivity() {
             ).show()
         }
 
-        // 帧调速V3开关（需屏幕捕获权限）
+        // 帧调速V3开关（需屏幕捕获权限 + 悬浮窗权限）
         switchFramePacing.setOnCheckedChangeListener { _, isChecked ->
             configManager.setFramePacingEnabled(isChecked)
             if (isChecked) {
+                // 先检查悬浮窗权限（Overlay 需要）
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                    Toast.makeText(this, "请先授予悬浮窗权限", Toast.LENGTH_SHORT).show()
+                    val overlayIntent = Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        android.net.Uri.parse("package:$packageName")
+                    )
+                    startActivityForResult(overlayIntent, REQUEST_CODE_OVERLAY)
+                    switchFramePacing.isChecked = false
+                    return@setOnCheckedChangeListener
+                }
+
                 // 请求屏幕捕获权限
                 val framePacingManager = com.spikeguard.framepacing.FramePacingManager.getInstance(this)
                 framePacingManager.setEnabled(true)

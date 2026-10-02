@@ -4,37 +4,40 @@ import android.graphics.SurfaceTexture
 import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
-import android.view.TextureView
 import com.spikeguard.util.LogManager
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 执行层：帧节奏输出引擎 + 看门狗容错
  *
- * 对应 V3 文档执行层 + 容错降级设计：
- * - DX11/DX12: Hook IDXGISwapChain::Present 插入延迟
- * - Vulkan: 隐式层拦截 vkQueuePresentKHR
- * - Android（无Root）: 在 TextureView 输出侧插入可控延迟
+ * Android 无 Root 帧节奏控制原理：
+ * MediaProjection 将屏幕画面渲染到一个 SurfaceTexture，
+ * 我们通过控制 SurfaceTexture.updateTexImage() 的调用时机来实现帧延迟呈现。
  *
- * 核心：不重排 GPU 命令缓冲区，只控制帧呈现时机
+ * 关键：updateTexImage() 是 SurfaceTexture 的"呈现"动作。
+ * 帧到达（onFrameAvailable）与 updateTexImage() 之间的时间差 = 调速延迟。
+ *
+ * 这相当于 DX12 的 IDXGISwapChain::Present Hook：
+ * - onFrameAvailable = 游戏调用 Present
+ * - updateTexImage() = 我们延迟后的实际呈现
+ *
+ * 不重排 GPU 命令缓冲区，不修改渲染内容，只改变帧呈现时机。
  *
  * 容错降级（看门狗机制，V3 修订版）：
- * 1. 独立监测线程生成心跳包，不依赖 Present/帧调用
- * 2. 判定规则：连续 N 次（N=3~5）帧输出未收到心跳包，判定逻辑卡死
- * 3. 单次计算耗时较长不属于卡死，允许等待
- * 4. 一旦判定卡死，自动切换直通旁路，所有调用原样转发，不崩溃
- *
- * Vulkan 隐式层环境变量（Android 不适用，预留 PC 端）：
- * - DISABLE_PSEUDOCEREBELLUM：启动前设置，运行期间修改无效
+ * 1. 独立监测线程生成心跳包，不依赖帧调用
+ * 2. 连续 N 次（N=3~5）未收到心跳 → 判定逻辑卡死 → 直通旁路
+ * 3. 直通模式下立即 updateTexImage()，不延迟，保证游戏画面不卡顿
  */
 class PacingDisplayEngine(
     private val logManager: LogManager,
-    private val governor: FramePacingGovernor,
-    private val outputSurfaceProvider: () -> Surface?
-) {
+    private val governor: FramePacingGovernor
+) : SurfaceTexture.OnFrameAvailableListener {
 
-    // 输出线程
+    // 输出 SurfaceTexture（MediaProjection 渲染目标）
+    private var surfaceTexture: SurfaceTexture? = null
+    private var outputSurface: Surface? = null
+
+    // 输出线程（处理 updateTexImage 时序）
     private var outputThread: HandlerThread? = null
     private var outputHandler: Handler? = null
 
@@ -44,29 +47,41 @@ class PacingDisplayEngine(
 
     // 心跳机制
     private val heartbeatCounter = AtomicInteger(0)
-    private val lastSeenHeartbeat = AtomicInteger(0)
     private val missedHeartbeatCount = AtomicInteger(0)
     private val maxMissedHeartbeats = 4  // N=3~5，取4
 
     // 状态
     @Volatile private var running = false
     @Volatile private var passThroughMode = false  // 直通旁路模式
-    private val pendingFrames = ArrayDeque<PacingFrame>()
-    private val maxPendingFrames = 5
+    @Volatile private var lastFrameTimestampNs = 0L
+    @Volatile private var pendingFrameAvailable = false
+
+    // 帧队列（仅在直通模式下处理延迟帧）
+    private val maxPendingFrames = 3
 
     // 统计
     private var displayedFrames = 0L
     private var delayedFrames = 0L
     private var watchdogTriggers = 0L
+    private var totalFrameTimeMs = 0f
 
     /**
-     * 待调速帧
+     * 绑定输出 SurfaceTexture
+     * MediaProjection 将通过此 SurfaceTexture 输出画面
+     *
+     * @param texture TextureView 的 SurfaceTexture
      */
-    private data class PacingFrame(
-        val surfaceTexture: SurfaceTexture,
-        val timestampNs: Long,
-        val frameTimeMs: Float
-    )
+    fun attachSurfaceTexture(texture: SurfaceTexture) {
+        this.surfaceTexture = texture
+        this.outputSurface = Surface(texture)
+        texture.setOnFrameAvailableListener(this, outputHandler)
+        logManager.i(TAG, "SurfaceTexture attached, output Surface created")
+    }
+
+    /**
+     * 获取输出 Surface（供 MediaProjection VirtualDisplay 使用）
+     */
+    fun getOutputSurface(): Surface? = outputSurface
 
     /**
      * 启动输出引擎
@@ -77,8 +92,14 @@ class PacingDisplayEngine(
         outputThread = HandlerThread("PacingOutput").apply { start() }
         outputHandler = Handler(outputThread!!.looper)
 
+        // 如果 SurfaceTexture 已绑定，重新设置监听器到输出线程
+        surfaceTexture?.let {
+            it.setOnFrameAvailableListener(this, outputHandler)
+        }
+
         running = true
         passThroughMode = false
+        lastFrameTimestampNs = 0L
 
         // 启动看门狗
         startWatchdog()
@@ -98,9 +119,7 @@ class PacingDisplayEngine(
         } catch (e: Exception) { /* 忽略 */ }
         watchdogThread = null
 
-        outputHandler?.post {
-            pendingFrames.clear()
-        }
+        outputHandler?.removeCallbacksAndMessages(null)
 
         try {
             outputThread?.quitSafely()
@@ -108,57 +127,89 @@ class PacingDisplayEngine(
         outputThread = null
         outputHandler = null
 
+        // 解绑
+        try {
+            surfaceTexture?.setOnFrameAvailableListener(null)
+        } catch (e: Exception) { /* 忽略 */ }
+
         logManager.i(TAG, "Pacing display engine stopped. " +
                 "displayed=$displayedFrames, delayed=$delayedFrames, " +
                 "watchdog_triggers=$watchdogTriggers")
     }
 
     /**
-     * 提交一帧进行调速输出
+     * SurfaceTexture 帧可用回调
      *
-     * @param frameTimeMs 本帧帧时间
-     * @param timestampNs 帧时间戳
+     * 这是帧节奏控制的核心入口：
+     * - 帧到达时记录时间戳，计算帧时间
+     * - 通过 governor 计算应插入的延迟
+     * - 延迟后调用 updateTexImage() 完成呈现
      */
-    fun submitFrame(frameTimeMs: Float, timestampNs: Long) {
+    override fun onFrameAvailable(st: SurfaceTexture) {
         if (!running) return
 
         // 更新心跳（帧处理线程存活证明）
         heartbeatCounter.incrementAndGet()
 
+        val now = System.nanoTime()
+        val frameTimeMs = if (lastFrameTimestampNs > 0) {
+            (now - lastFrameTimestampNs) / 1_000_000f
+        } else {
+            16.67f  // 初始帧假设60fps
+        }
+        lastFrameTimestampNs = now
+        totalFrameTimeMs += frameTimeMs
+
         if (passThroughMode) {
-            // 直通模式：直接输出，不调速
-            outputFrame(frameTimeMs, 0f)
+            // 直通旁路：立即呈现，不调速
+            presentFrame(st, frameTimeMs, 0f)
             return
         }
 
         // 调速：计算延迟
         val delayMs = governor.onFrame(frameTimeMs)
 
-        if (delayMs <= 0f) {
-            // 无需调速，立即输出
-            outputFrame(frameTimeMs, 0f)
+        if (delayMs <= 0.01f) {
+            // 无需调速，立即呈现
+            presentFrame(st, frameTimeMs, 0f)
         } else {
-            // 延迟输出
+            // 延迟呈现：在输出线程上延时调用 updateTexImage
             delayedFrames++
             outputHandler?.postDelayed({
-                if (running && !passThroughMode) {
-                    outputFrame(frameTimeMs, delayMs)
+                if (running) {
+                    if (passThroughMode) {
+                        // 延迟期间切换到直通，立即呈现
+                        presentFrame(st, frameTimeMs, 0f)
+                    } else {
+                        presentFrame(st, frameTimeMs, delayMs)
+                    }
                 }
-            }, delayMs.toLong())
+            }, delayMs.toLong().coerceAtLeast(1L))
         }
     }
 
     /**
-     * 输出一帧到目标 Surface
+     * 呈现一帧：调用 updateTexImage()
+     *
+     * 这是 Android SurfaceTexture 的"Present"动作。
+     * updateTexImage() 将最新的图像帧更新到 GL 纹理，
+     * 绑定的 TextureView 会自动渲染。
      */
-    private fun outputFrame(frameTimeMs: Float, delayMs: Float) {
-        displayedFrames++
-        // Android 无Root方案：画面通过 MediaProjection 捕获后已在系统层面呈现，
-        // 调速通过延迟下一次帧捕获的处理来实现节奏控制
-        // 此处记录日志，实际画面输出由系统合成器完成
-        if (delayMs > 0) {
-            logManager.d(TAG, "Frame output: frameTime=${"%.2f".format(frameTimeMs)}ms, " +
-                    "delay=${"%.3f".format(delayMs)}ms, passThrough=$passThroughMode")
+    private fun presentFrame(st: SurfaceTexture, frameTimeMs: Float, delayMs: Float) {
+        try {
+            st.updateTexImage()
+            displayedFrames++
+
+            if (delayMs > 0 && displayedFrames % 60 == 0L) {
+                val avgFrameTime = totalFrameTimeMs / displayedFrames
+                logManager.d(TAG, "Present: frameTime=${"%.2f".format(frameTimeMs)}ms, " +
+                        "delay=${"%.3f".format(delayMs)}ms, " +
+                        "avgFrameTime=${"%.2f".format(avgFrameTime)}ms, " +
+                        "passThrough=$passThroughMode")
+            }
+        } catch (e: Exception) {
+            logManager.e(TAG, "updateTexImage failed", e)
+            // updateTexImage 失败不应该导致崩溃，忽略本帧
         }
     }
 
@@ -167,8 +218,10 @@ class PacingDisplayEngine(
     /**
      * 启动看门狗线程
      *
-     * 独立线程生成心跳包，不依赖帧调用
-     * 判定规则：连续N次帧输出未收到心跳包 → 逻辑卡死 → 直通旁路
+     * V3 修订：废弃固定50ms超时，改用与帧率解耦的心跳机制
+     * - 独立线程每500ms检查一次心跳
+     * - 连续N=4次心跳未更新 → 逻辑卡死 → 直通旁路
+     * - 单次计算耗时较长不属于卡死
      */
     private fun startWatchdog() {
         watchdogRunning = true
@@ -178,17 +231,16 @@ class PacingDisplayEngine(
 
             while (watchdogRunning && running) {
                 try {
-                    Thread.sleep(500)  // 每500ms检查一次
+                    Thread.sleep(500)
 
                     val currentHeartbeat = heartbeatCounter.get()
                     if (currentHeartbeat == lastHeartbeat) {
-                        // 心跳未更新
+                        // 心跳未更新（没有新帧到达或处理线程阻塞）
                         val missed = missedHeartbeatCount.incrementAndGet()
                         logManager.w(TAG, "Watchdog: missed heartbeat $missed/$maxMissedHeartbeats")
 
                         if (missed >= maxMissedHeartbeats) {
-                            // 判定卡死，切换直通旁路
-                            triggerPassThrough("watchdog_timeout_missed_$missed")
+                            triggerPassThrough("watchdog_missed_$missed")
                         }
                     } else {
                         // 心跳正常，重置计数
@@ -209,7 +261,7 @@ class PacingDisplayEngine(
 
     /**
      * 触发直通旁路模式
-     * 所有调用原样转发，不崩溃
+     * 所有帧立即 updateTexImage()，不延迟，保证画面不卡顿不崩溃
      */
     private fun triggerPassThrough(reason: String) {
         if (passThroughMode) return
@@ -218,10 +270,10 @@ class PacingDisplayEngine(
         missedHeartbeatCount.set(0)
 
         logManager.w(TAG, "=== PASS-THROUGH MODE TRIGGERED: $reason ===")
-        logManager.w(TAG, "All frame calls forwarded directly, no pacing applied")
+        logManager.w(TAG, "All frames presented immediately, no pacing applied")
 
-        // 通知 UI
-        // 这里可以通过 MessageBus 或回调通知状态变化
+        // 清空所有待延迟的帧回调，立即呈现
+        outputHandler?.removeCallbacksAndMessages(null)
     }
 
     /**
@@ -231,6 +283,7 @@ class PacingDisplayEngine(
         if (!passThroughMode) return
         passThroughMode = false
         missedHeartbeatCount.set(0)
+        lastFrameTimestampNs = 0L  // 重置帧时间基准
         logManager.i(TAG, "Recovered from pass-through mode")
     }
 
@@ -246,6 +299,7 @@ class PacingDisplayEngine(
         "displayed_frames" to displayedFrames,
         "delayed_frames" to delayedFrames,
         "delay_ratio" to if (displayedFrames > 0) delayedFrames.toFloat() / displayedFrames else 0f,
+        "avg_frame_time_ms" to if (displayedFrames > 0) totalFrameTimeMs / displayedFrames else 0f,
         "pass_through" to passThroughMode,
         "watchdog_triggers" to watchdogTriggers,
         "missed_heartbeats" to missedHeartbeatCount.get()
