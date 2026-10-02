@@ -346,6 +346,95 @@ class ConfigManager(private val context: Context) {
         }
     }
 
+    // ==================== 帧调速V3配置 ====================
+
+    /**
+     * 帧调速是否启用
+     */
+    fun isFramePacingEnabled(): Boolean {
+        return try {
+            config.getJSONObject("frame_pacing").getBoolean("enabled")
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 设置帧调速开关
+     */
+    fun setFramePacingEnabled(enabled: Boolean) {
+        try {
+            val fp = config.optJSONObject("frame_pacing") ?: org.json.JSONObject()
+            fp.put("enabled", enabled)
+            config.put("frame_pacing", fp)
+            saveConfig()
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Failed to set frame pacing enabled", e)
+        }
+    }
+
+    /**
+     * 低延迟模式是否启用
+     */
+    fun isFramePacingLowLatency(): Boolean {
+        return try {
+            config.getJSONObject("frame_pacing").getJSONObject("latency").getBoolean("low_latency_mode")
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 设置低延迟模式
+     */
+    fun setFramePacingLowLatency(enabled: Boolean) {
+        try {
+            val fp = config.getJSONObject("frame_pacing")
+            val latency = fp.getJSONObject("latency")
+            latency.put("low_latency_mode", enabled)
+            fp.put("latency", latency)
+            config.put("frame_pacing", fp)
+            saveConfig()
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Failed to set low latency mode", e)
+        }
+    }
+
+    /**
+     * 获取帧调速默认延迟上限
+     */
+    fun getFramePacingDefaultLatency(): Float {
+        return try {
+            config.getJSONObject("frame_pacing").getJSONObject("latency")
+                .getDouble("default_max_ms").toFloat()
+        } catch (e: Exception) {
+            1.5f
+        }
+    }
+
+    /**
+     * 获取帧调速低延迟上限
+     */
+    fun getFramePacingLowLatency(): Float {
+        return try {
+            config.getJSONObject("frame_pacing").getJSONObject("latency")
+                .getDouble("low_latency_max_ms").toFloat()
+        } catch (e: Exception) {
+            0.5f
+        }
+    }
+
+    /**
+     * 获取帧调速看门狗配置
+     */
+    fun getFramePacingWatchdogConfig(): org.json.JSONObject {
+        return try {
+            config.getJSONObject("frame_pacing").getJSONObject("watchdog")
+        } catch (e: Exception) {
+            org.json.JSONObject()
+        }
+    }
+
     /**
      * 获取日志配置
      */

@@ -45,6 +45,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchAutoStart: Switch
     private lateinit var switchFloatingWindow: Switch
     private lateinit var switchPseudoCerebellum: Switch
+    private lateinit var switchFramePacing: Switch
+    private lateinit var switchLowLatency: Switch
     private lateinit var btnExportConfig: Button
     private lateinit var btnImportConfig: Button
     private lateinit var btnExportLog: Button
@@ -60,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val REQUEST_CODE_IMPORT_CONFIG = 1001
         private const val REQUEST_CODE_OVERLAY = 1002
+        private const val REQUEST_CODE_FRAME_PACING_CAPTURE = 1003
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -102,6 +105,8 @@ class MainActivity : AppCompatActivity() {
         switchAutoStart = findViewById(R.id.switchAutoStart)
         switchFloatingWindow = findViewById(R.id.switchFloatingWindow)
         switchPseudoCerebellum = findViewById(R.id.switchPseudoCerebellum)
+        switchFramePacing = findViewById(R.id.switchFramePacing)
+        switchLowLatency = findViewById(R.id.switchLowLatency)
         btnExportConfig = findViewById(R.id.btnExportConfig)
         btnImportConfig = findViewById(R.id.btnImportConfig)
         btnExportLog = findViewById(R.id.btnExportLog)
@@ -153,6 +158,39 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(
                 this,
                 if (isChecked) "伪小脑已启用" else "伪小脑已禁用",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
+        // 帧调速V3开关（需屏幕捕获权限）
+        switchFramePacing.setOnCheckedChangeListener { _, isChecked ->
+            configManager.setFramePacingEnabled(isChecked)
+            if (isChecked) {
+                // 请求屏幕捕获权限
+                val framePacingManager = com.spikeguard.framepacing.FramePacingManager.getInstance(this)
+                framePacingManager.setEnabled(true)
+                val captureIntent = framePacingManager.requestCapturePermission()
+                if (captureIntent != null) {
+                    startActivityForResult(captureIntent, REQUEST_CODE_FRAME_PACING_CAPTURE)
+                } else {
+                    Toast.makeText(this, "无法启动屏幕捕获", Toast.LENGTH_SHORT).show()
+                    switchFramePacing.isChecked = false
+                }
+            } else {
+                // 停止帧调速
+                com.spikeguard.framepacing.FramePacingManager.getInstance(this).stop()
+                Toast.makeText(this, "帧调速已停止", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        // 低延迟模式开关
+        switchLowLatency.setOnCheckedChangeListener { _, isChecked ->
+            configManager.setFramePacingLowLatency(isChecked)
+            val fpm = com.spikeguard.framepacing.FramePacingManager.getInstance(this)
+            fpm.setLowLatencyMode(isChecked)
+            Toast.makeText(
+                this,
+                if (isChecked) "低延迟模式已开启（上限0.5ms）" else "低延迟模式已关闭（上限1.5ms）",
                 Toast.LENGTH_SHORT
             ).show()
         }
@@ -374,6 +412,10 @@ class MainActivity : AppCompatActivity() {
         switchPermission.isChecked = configManager.getPermissionMode() == PermissionMode.ROOT
         // 加载伪小脑开关状态
         switchPseudoCerebellum.isChecked = configManager.isPseudoCerebellumEnabled()
+        // 加载帧调速开关状态
+        switchFramePacing.isChecked = configManager.isFramePacingEnabled()
+        // 加载低延迟模式状态
+        switchLowLatency.isChecked = configManager.isFramePacingLowLatency()
 
         updateModeDisplay()
         updatePermissionDisplay()
@@ -549,6 +591,21 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         Toast.makeText(this, "悬浮窗权限被拒绝", Toast.LENGTH_SHORT).show()
                     }
+                }
+            }
+            REQUEST_CODE_FRAME_PACING_CAPTURE -> {
+                if (resultCode == RESULT_OK && data != null) {
+                    // 屏幕捕获权限已授予，启动帧调速
+                    val fpm = com.spikeguard.framepacing.FramePacingManager.getInstance(this)
+                    fpm.startWithPermission(resultCode, data)
+                    // 应用低延迟模式设置
+                    fpm.setLowLatencyMode(configManager.isFramePacingLowLatency())
+                    Toast.makeText(this, "帧调速V3已启动", Toast.LENGTH_SHORT).show()
+                } else {
+                    // 权限被拒绝，关闭开关
+                    switchFramePacing.isChecked = false
+                    configManager.setFramePacingEnabled(false)
+                    Toast.makeText(this, "屏幕捕获权限被拒绝", Toast.LENGTH_SHORT).show()
                 }
             }
         }

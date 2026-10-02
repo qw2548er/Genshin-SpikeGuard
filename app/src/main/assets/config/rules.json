@@ -35,6 +35,32 @@
       "recovery_check_interval_ms": 1000
     }
   },
+  "frame_pacing": {
+    "enabled": false,
+    "description": "帧级自适应调速器V3：双路EWMA决策+可变延迟输出，平滑帧时间方差。不重排GPU命令缓冲区，不修改渲染内容。",
+    "governor": {
+      "fast_ewma_frames": 10,
+      "slow_ewma_frames": 60,
+      "spike_threshold_multiplier": 1.5,
+      "consecutive_spike_frames": 3,
+      "rolling_window_size": 60
+    },
+    "latency": {
+      "default_max_ms": 1.5,
+      "low_latency_max_ms": 0.5,
+      "low_latency_mode": false,
+      "max_accumulated_drift_ms": 5.0
+    },
+    "watchdog": {
+      "max_missed_heartbeats": 4,
+      "check_interval_ms": 500
+    },
+    "android": {
+      "capture_format": "RGBA_8888",
+      "max_buffers": 3,
+      "note": "无Root方案：MediaProjection+VirtualDisplay+ImageReader，仅画面输出侧节流"
+    }
+  },
   "protection_flow": {
     "steps": [
       "detect_battle_settlement",
